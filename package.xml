@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>perception_models</name>
+  <version>0.0.0</version>
+  <description>
+    CLIPSeg + NanoSAM inference backends and ONNX/TensorRT artifacts for HOUND.
+    Dora/ROS nodes live in hound_core; this package owns model code and engines.
+  </description>
+  <maintainer email="hound@todo.todo">hound</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- torch, transformers, tensorrt, torch2trt, nanosam (nanosam-src) via pip -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
