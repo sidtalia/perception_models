@@ -17,10 +17,13 @@ setup(
             [
                 "scripts/export_clipseg_vision_onnx.py",
                 "scripts/build_clipseg_vision_engine.sh",
+                "scripts/build_all_engines.sh",
                 "scripts/bench_clipseg.py",
                 "scripts/export_nanosam_mask_decoder_batched_onnx.py",
                 "scripts/build_nanosam_mask_decoder_batched_engine.sh",
                 "scripts/build_nanosam_512_pair.sh",
+                "scripts/export_yolo_world.py",
+                "scripts/bench_yolo_world.py",
             ],
         ),
     ],

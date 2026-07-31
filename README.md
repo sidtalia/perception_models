@@ -35,15 +35,18 @@ copying engines across boxes with different TensorRT versions.
 
 ## Rebuild
 
-```bash
-# CLIPSeg vision TRT
-bash /root/colcon_ws/src/perception_models/scripts/build_clipseg_vision_engine.sh
-python3 /root/colcon_ws/src/perception_models/scripts/bench_clipseg.py \
-  --trt-engine /root/colcon_ws/src/perception_models/data/clipseg_vision_rd16_224.engine
+On each Jetson (Orin NX / Thor), rebuild engines — do not copy `.engine` files
+across boxes:
 
-# NanoSAM 512 pair
+```bash
+# All of: CLIPSeg TRT + NanoSAM 512 pair + YOLO-World stashed .pt
+bash /root/colcon_ws/src/perception_models/scripts/build_all_engines.sh
+
+# Or piece-wise:
+bash /root/colcon_ws/src/perception_models/scripts/build_clipseg_vision_engine.sh
 bash /root/colcon_ws/src/perception_models/scripts/build_nanosam_512_pair.sh \
   /root/colcon_ws/src/perception_models/data 16 32
+python3 /root/colcon_ws/src/perception_models/scripts/export_yolo_world.py --format pt
 ```
 
 Upstream MobileSAM / NanoSAM tooling lives in `nanosam-src/` (`pip install -e`).
