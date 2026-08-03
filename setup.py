@@ -1,3 +1,6 @@
+import os
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "perception_models"
@@ -5,7 +8,7 @@ package_name = "perception_models"
 setup(
     name=package_name,
     version="0.0.0",
-    packages=find_packages(exclude=["test"]),
+    packages=find_packages(exclude=["test", "legacy"]),
     data_files=[
         (
             "share/ament_index/resource_index/packages",
@@ -13,7 +16,11 @@ setup(
         ),
         ("share/" + package_name, ["package.xml", "README.md"]),
         (
-            "lib/" + package_name,
+            os.path.join("share", package_name, "dora"),
+            glob("dora/*"),
+        ),
+        (
+            os.path.join("lib", package_name),
             [
                 "scripts/export_clipseg_vision_onnx.py",
                 "scripts/build_clipseg_vision_engine.sh",
@@ -24,6 +31,10 @@ setup(
                 "scripts/build_nanosam_512_pair.sh",
                 "scripts/export_yolo_world.py",
                 "scripts/bench_yolo_world.py",
+                "scripts/install_deps.sh",
+                "scripts/dora_clipseg_encoder",
+                "scripts/dora_seg_refine",
+                "scripts/dora_yolo_world",
             ],
         ),
     ],
@@ -31,6 +42,13 @@ setup(
     zip_safe=True,
     maintainer="hound",
     maintainer_email="hound@todo.todo",
-    description="CLIPSeg + NanoSAM backends and TRT engines for HOUND perception.",
+    description="CLIPSeg + NanoSAM + YOLO-World backends, Dora nodes, and TRT engines.",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "dora_clipseg_encoder = perception_models.dora_clipseg_encoder:main",
+            "dora_seg_refine = perception_models.dora_seg_refine:main",
+            "dora_yolo_world = perception_models.dora_yolo_world:main",
+        ],
+    },
 )
