@@ -141,7 +141,9 @@ bash .../build_nanosam_mask_decoder_batched_engine.sh <onnx> <engine> <opt> <max
 - `enabled`, `sam_node`, prompts / `positive_groups` / `negative_groups`
 - `clipseg_vision_engine` — TRT vision path; empty = torch
 - `threshold` — FiLM→label gate (affects SAM box proposals)
-- `publish_coarse_traversability` + `coarse_*_topic` — FiLM trav/people (works with `sam_node: false`)
+- `publish_coarse_traversability` + `coarse_*_topic` — FiLM trav/people (works with `sam_node: false`);
+  trav rgb8 uses `traversability_colors` (priority: non_trav > people > trav > none).
+  Empty `prompts.traversable` / `prompts.people` → nav-only (unlabeled = `none` color).
 - `sam_image_*`, `sam_image_size`, `sam_max_boxes`, `sam_max_boxes_manip`, `sam_min_area`
 - `use_cuda_streams`, `pipeline_queue_size`
 - `profile` / `profile_every` — stage logs; leave **false** for production FPS
@@ -149,6 +151,28 @@ bash .../build_nanosam_mask_decoder_batched_engine.sh <onnx> <engine> <opt> <max
 
 Nav-only (no NanoSAM): `sam_node: false`, subscribe
 `/segmentation/coarse_traversability`.
+
+Example nav-only prompts: `traversable: []`, `people: []`, fill `non_traversable`.
+Set `traversability_colors.none` and `.non_traversable` for mapper cost (white/black).
+
+## Multi-cam batch (`feature/multicam-batch`)
+
+SSoT `segmentation`:
+
+```yaml
+color_topics: ["/front/color/image_raw", "/left/color/image_raw", "/right/color/image_raw"]
+camera_names: ["front", "left", "right"]
+clipseg_batch_n: 3
+```
+
+Encoder packs N RGB → Dora `rgb` + features `[N,L,S,D]`. Refine publishes
+`/segmentation/{name}/coarse_traversability`. Optional TRT batch=3:
+
+```bash
+bash scripts/build_clipseg_vision_engine.sh data CIDAS/clipseg-rd16 224 3
+```
+
+Capture smoke: `stereo_composite.backend: dataset_replay` + multicam rail dataset.
 
 Measure with `ros2 topic hz` on coarse or refined trav topics,
 not only in-process timers (profilers add sync fences).

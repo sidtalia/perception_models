@@ -132,25 +132,41 @@ class ClipSegParts:
     @torch.inference_mode()
     def preprocess_rgb(self, rgb_uint8: np.ndarray) -> torch.Tensor:
         """HxWx3 uint8 -> normalized [1,3,res,res] float on device."""
-        t = (
-            torch.from_numpy(rgb_uint8)
-            .to(self.device)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .float()
-            .div_(255.0)
-        )
+        return self.preprocess_rgb_batch([rgb_uint8])
+
+    @torch.inference_mode()
+    def preprocess_rgb_batch(self, rgbs: list) -> torch.Tensor:
+        """List of HxWx3 uint8 -> normalized [N,3,res,res] float on device."""
+        tensors = []
+        for rgb_uint8 in rgbs:
+            t = (
+                torch.from_numpy(np.ascontiguousarray(rgb_uint8))
+                .to(self.device)
+                .permute(2, 0, 1)
+                .float()
+                .div_(255.0)
+            )
+            tensors.append(t)
+        pix = torch.stack(tensors, dim=0)
         pix = F.interpolate(
-            t, size=(self.res, self.res), mode="bilinear", align_corners=False
+            pix, size=(self.res, self.res), mode="bilinear", align_corners=False
         )
         return (pix - self.mean) / self.std
 
     @torch.inference_mode()
     def encode(self, rgb_uint8: np.ndarray, enc: nn.Module) -> torch.Tensor:
         """-> stacked hidden states [L, S, D]."""
-        pix = self.preprocess_rgb(rgb_uint8)
+        hs = self.encode_batch([rgb_uint8], enc)
+        return hs[0]
+
+    @torch.inference_mode()
+    def encode_batch(self, rgbs: list, enc: nn.Module) -> torch.Tensor:
+        """-> stacked hidden states [N, L, S, D]."""
+        pix = self.preprocess_rgb_batch(rgbs)
         with torch.autocast("cuda", dtype=torch.float16):
             hs = enc(pix)
+        if hs.dim() == 3:
+            hs = hs.unsqueeze(0)
         return hs.float().clone()
 
     @torch.inference_mode()
@@ -215,17 +231,18 @@ class ClipSegParts:
                 self.extract = list(outer.extract)
 
             def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-                # pixel_values: [1,3,res,res] -> [L,S,D]
+                # pixel_values: [N,3,res,res] -> [N,L,S,D] (N=1 squeezable by caller)
                 vo = self.model.clip.vision_model(
                     pixel_values=pixel_values,
                     output_hidden_states=True,
                     return_dict=True,
                 )
                 layers = [
-                    vo.hidden_states[i + 1].contiguous()  # [1,S,D]
+                    vo.hidden_states[i + 1].contiguous()  # [N,S,D]
                     for i in self.extract
                 ]
-                return torch.stack(layers, dim=1)[0]  # [L,S,D]
+                # stack on layer dim → [N,L,S,D]
+                return torch.stack(layers, dim=1)
 
         return _Enc().eval()
 
@@ -254,7 +271,10 @@ class ClipSegParts:
         def run(mod: nn.Module):
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 for _ in range(3):
-                    _ = mod(dummy)
+                    out = mod(dummy)
+                    if out.dim() == 4 and out.shape[0] == 1:
+                        out = out[0]
+                    _ = out
             torch.cuda.synchronize()
 
         try:
@@ -272,6 +292,8 @@ class ClipSegParts:
         dummy = torch.zeros(1, 3, self.res, self.res, device=self.device)
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
             hs = enc(dummy).float()
+            if hs.dim() == 4:
+                hs = hs[0]
 
         def run(mod: nn.Module):
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):

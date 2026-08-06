@@ -16,6 +16,87 @@ PALETTE = [
     (230, 0, 230),
 ]
 
+# Default trav rgb8 colors (RGB). Mapper cost ≈ 1 - BT.601(luminance)/255.
+DEFAULT_TRAVERSABILITY_COLORS = {
+    "traversable": [0, 200, 0],
+    "non_traversable": [220, 0, 0],
+    "people": [0, 80, 255],
+    "none": [255, 255, 255],
+}
+
+
+def parse_rgb_color(value, default: list[int]) -> np.ndarray:
+    if value is None:
+        return np.asarray(default, dtype=np.float32)
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return np.asarray([float(value[0]), float(value[1]), float(value[2])], dtype=np.float32)
+    return np.asarray(default, dtype=np.float32)
+
+
+def traversability_colors_from_config(cfg: dict) -> dict[str, np.ndarray]:
+    raw = cfg.get("traversability_colors") or {}
+    return {
+        key: parse_rgb_color(raw.get(key), DEFAULT_TRAVERSABILITY_COLORS[key])
+        for key in DEFAULT_TRAVERSABILITY_COLORS
+    }
+
+
+def pack_traversability_rgb(
+    group_maps,
+    *,
+    positive_groups,
+    negative_groups,
+    people_groups,
+    group_has_prompts: list[bool],
+    colors: dict[str, np.ndarray],
+    threshold: float = 0.5,
+):
+    """Paint trav rgb8 from per-group maps [G,H,W] with role-based colors.
+
+    Empty prompt groups are skipped (union is zero). Unlabeled pixels keep
+    ``none``. Priority: non_traversable > people > traversable > none.
+    Returns (rgb uint8 HxWx3, confidence HxW float tensor on group_maps device).
+    """
+    import torch
+
+    def _union(idxs):
+        sel = [
+            i
+            for i in idxs
+            if 0 <= i < group_maps.shape[0] and group_has_prompts[i]
+        ]
+        if not sel:
+            return group_maps.new_zeros(group_maps.shape[1:])
+        return group_maps[sel].amax(dim=0)
+
+    trav = _union(positive_groups)
+    people = _union(people_groups)
+    nontrav = _union(negative_groups)
+
+    h, w = nontrav.shape
+    dev = group_maps.device
+
+    def _c(key: str) -> "torch.Tensor":
+        return torch.as_tensor(colors[key], device=dev, dtype=torch.float32)
+
+    rgb = _c("none").view(1, 1, 3).expand(h, w, 3).clone()
+    tc = _c("traversable")
+    pc = _c("people")
+    nc = _c("non_traversable")
+
+    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in positive_groups):
+        rgb[trav >= threshold] = tc
+
+    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in people_groups):
+        rgb[people >= threshold] = pc
+
+    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in negative_groups):
+        rgb[nontrav >= threshold] = nc
+
+    conf = torch.maximum(torch.maximum(trav, people), nontrav)
+    rgb_np = rgb.clamp(0.0, 255.0).to(torch.uint8).cpu().numpy()
+    return rgb_np, conf
+
 
 def extract_boxes(binary_np: np.ndarray, min_area: float, max_boxes: int):
     """Per-class binary masks [n,H,W] (uint8) -> largest blobs as

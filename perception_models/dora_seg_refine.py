@@ -41,20 +41,27 @@ from perception_models.sam_box_merge import (
     parse_yolo_detections_json,
     yolo_manip_boxes,
 )
+from perception_models.multicam_rgb_batch import unpack_rgb_batch
 from perception_models.seg_ops import (
     blend_overlay,
     labels_to_boxes,
     labels_to_color,
+    pack_traversability_rgb,
     probs_to_labels,
+    traversability_colors_from_config,
 )
 
 
 def _feature_shape(meta: dict) -> tuple[int, ...]:
-    return (
+    n_batch = int(meta.get("feature_batch", meta.get("n_cams", 1)))
+    base = (
         int(meta["n_layers"]),
         int(meta["seq_len"]),
         int(meta["hidden"]),
     )
+    if n_batch > 1:
+        return (n_batch, *base)
+    return base
 
 
 def _open_features(event, *, non_blocking: bool = False) -> torch.Tensor:
@@ -71,6 +78,14 @@ def _open_features(event, *, non_blocking: bool = False) -> torch.Tensor:
         with open_ipc_handle(handle, meta) as tensor:
             return tensor.reshape(*shape).contiguous().clone()
     return unpack_arrow_f16(event["value"], shape, non_blocking=non_blocking)
+
+
+def _cam_short_name(frame_id: str, index: int) -> str:
+    fid = str(frame_id or "")
+    for token in ("front", "left", "right"):
+        if token in fid:
+            return token
+    return f"cam{index}"
 
 
 def _union(refined: torch.Tensor, idxs) -> torch.Tensor:
@@ -107,6 +122,9 @@ def main():
 
     aggregate = str(cfg.get("aggregate", "max")).lower()
     threshold = float(cfg.get("threshold", 0.3))
+    trav_pack_threshold = float(cfg.get("traversability_pack_threshold", threshold))
+    trav_colors = traversability_colors_from_config(cfg)
+    group_has_prompts = [len(idx) > 0 for idx in layout.group_index]
     viz_overlay = bool(cfg.get("viz_overlay", False))
     overlay_alpha = float(cfg.get("overlay_alpha", 0.5))
     labels_topic = str(cfg.get("labels_topic", "/segmentation/labels"))
@@ -160,8 +178,10 @@ def main():
         )
 
     # Coarse FiLM traversability — independent of NanoSAM.
+    # Multicam: also publish /segmentation/{cam}/coarse_traversability.
     publish_coarse = bool(cfg.get("publish_coarse_traversability", True))
     coarse_trav_pub = coarse_people_pub = None
+    coarse_trav_pubs: dict = {}
     if publish_coarse:
         coarse_trav_pub = ros.create_publisher(
             Image,
@@ -183,6 +203,12 @@ def main():
             ),
             qos_profile_sensor_data,
         )
+        for name in cfg.get("camera_names") or ["front", "left", "right"]:
+            coarse_trav_pubs[str(name)] = ros.create_publisher(
+                Image,
+                f"/segmentation/{name}/coarse_traversability",
+                qos_profile_sensor_data,
+            )
 
     sam_enabled = bool(cfg.get("sam_node", False))
     sam_encoder = sam_decoder = None
@@ -253,31 +279,41 @@ def main():
     )
 
     def _pack_trav_rgb(group_maps):
-        trav = _union(group_maps, positive_groups)
-        nontrav = _union(group_maps, negative_groups)
-        none = (1.0 - torch.maximum(trav, nontrav)).clamp_(0.0, 1.0)
-        rgb_t = torch.stack([nontrav, trav, none], dim=-1)
-        rgb_np = (rgb_t * 255.0).to(torch.uint8).cpu().numpy()
-        conf = torch.maximum(trav, nontrav)
-        return rgb_np, conf
+        return pack_traversability_rgb(
+            group_maps,
+            positive_groups=positive_groups,
+            negative_groups=negative_groups,
+            people_groups=people_groups,
+            group_has_prompts=group_has_prompts,
+            colors=trav_colors,
+            threshold=trav_pack_threshold,
+        )
 
-    def _publish_coarse(probs, rgb, hdr):
-        if coarse_trav_pub is None:
+    def _publish_coarse(probs, rgb, hdr, *, cam_name: str | None = None):
+        if coarse_trav_pub is None and not coarse_trav_pubs:
             return
         rgb_np, _conf = _pack_trav_rgb(probs)
-        coarse_trav_pub.publish(to_image(bridge, rgb_np, "rgb8", hdr))
-        if not yolo_owns_people and coarse_people_pub is not None:
+        img = to_image(bridge, rgb_np, "rgb8", hdr)
+        if cam_name and cam_name in coarse_trav_pubs:
+            coarse_trav_pubs[cam_name].publish(img)
+        if coarse_trav_pub is not None and (cam_name is None or cam_name == "front"):
+            coarse_trav_pub.publish(img)
+        if not yolo_owns_people and coarse_people_pub is not None and (
+            cam_name is None or cam_name == "front"
+        ):
             people = _union(probs, people_groups)
             people_np = (people.cpu().numpy() >= 0.5).astype(np.uint8) * 255
             coarse_people_pub.publish(to_image(bridge, people_np, "mono8", hdr))
 
     def _publish_trav(refined_nav, rgb, hdr, *, people_mask=None):
         """Publish refined traversability (+ optional overlay). People separate."""
-        rgb_np, conf = _pack_trav_rgb(refined_nav)
+        rgb_np, nontrav = _pack_trav_rgb(refined_nav)
         if trav_pub is not None:
             trav_pub.publish(to_image(bridge, rgb_np, "rgb8", hdr))
         if sam_overlay_pub is not None:
-            ov = blend_overlay(rgb, rgb_np, conf.cpu().numpy(), overlay_alpha)
+            ov = blend_overlay(
+                rgb, rgb_np, nontrav.cpu().numpy(), overlay_alpha
+            )
             if people_mask is not None:
                 pm = (people_mask.cpu().numpy() >= 0.5)
                 ov = ov.copy()
@@ -360,7 +396,7 @@ def main():
             hs, dec, height=h, width=w, aggregate=aggregate
         )
 
-    def _process_frame(_stamp_key, meta_rgb, rgb, feat_event):
+    def _process_frame(_stamp_key, meta_rgb, rgb, feat_event, *, cam_name=None, hs_slice=None):
         nonlocal prof, prof_n
         h = int(meta_rgb["height"])
         w = int(meta_rgb["width"])
@@ -386,7 +422,12 @@ def main():
             with torch.cuda.stream(stream_film):
                 if profile:
                     ev_film0.record(stream_film)
-                hs = _open_features(feat_event, non_blocking=True)
+                if hs_slice is not None:
+                    hs = hs_slice
+                else:
+                    hs = _open_features(feat_event, non_blocking=True)
+                    if hs.dim() == 4:
+                        hs = hs[0]
                 probs = _decode(hs, h, w, feat_meta)
                 if profile:
                     ev_film1.record(stream_film)
@@ -407,7 +448,7 @@ def main():
                 color = labels_to_color(labels_np, layout.n_groups)
                 overlay = blend_overlay(rgb, color, conf_np, overlay_alpha)
                 overlay_pub.publish(to_image(bridge, overlay, "rgb8", hdr))
-            _publish_coarse(probs, rgb, hdr)
+            _publish_coarse(probs, rgb, hdr, cam_name=cam_name)
 
             rclpy.spin_once(ros, timeout_sec=0.0)
             stream_sam.synchronize()
@@ -452,7 +493,12 @@ def main():
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-        hs = _open_features(feat_event)
+        if hs_slice is not None:
+            hs = hs_slice
+        else:
+            hs = _open_features(feat_event)
+            if hs.dim() == 4:
+                hs = hs[0]
         if profile:
             torch.cuda.synchronize()
             t1 = time.perf_counter()
@@ -471,7 +517,7 @@ def main():
             color = labels_to_color(labels_np, layout.n_groups)
             overlay = blend_overlay(rgb, color, conf_np, overlay_alpha)
             overlay_pub.publish(to_image(bridge, overlay, "rgb8", hdr))
-        _publish_coarse(probs, rgb, hdr)
+        _publish_coarse(probs, rgb, hdr, cam_name=cam_name)
 
         if sam_encoder is not None and sam_decoder is not None:
             if profile:
@@ -515,11 +561,16 @@ def main():
         stamp_key = (int(meta.get("stamp_sec", 0)), int(meta.get("stamp_nanosec", 0)))
 
         if eid == "rgb":
+            n_cams = int(meta.get("n_cams", 1))
             hh = int(meta["height"])
             ww = int(meta["width"])
-            flat = event["value"].to_numpy()
-            rgb = np.asarray(flat, dtype=np.uint8).reshape(hh, ww, 3)
-            rgb_buf[stamp_key] = (meta, np.ascontiguousarray(rgb))
+            if n_cams > 1:
+                rgbs = unpack_rgb_batch(event["value"], meta)
+                rgb_buf[stamp_key] = (meta, rgbs)
+            else:
+                flat = event["value"].to_numpy()
+                rgb = np.asarray(flat, dtype=np.uint8).reshape(hh, ww, 3)
+                rgb_buf[stamp_key] = (meta, np.ascontiguousarray(rgb))
             while len(rgb_buf) > qlen:
                 rgb_buf.pop(next(iter(rgb_buf)))
         elif eid == "features":
@@ -540,9 +591,41 @@ def main():
                 rclpy.spin_once(ros, timeout_sec=0.0)
 
         if stamp_key in rgb_buf and stamp_key in feat_buf:
-            meta_rgb, rgb = rgb_buf.pop(stamp_key)
+            meta_rgb, rgb_or_list = rgb_buf.pop(stamp_key)
             feat_event = feat_buf.pop(stamp_key)
-            _process_frame(stamp_key, meta_rgb, rgb, feat_event)
+            n_cams = int(meta_rgb.get("n_cams", 1))
+            if n_cams > 1 and isinstance(rgb_or_list, list):
+                hs_all = _open_features(feat_event)
+                if hs_all.dim() == 3:
+                    hs_all = hs_all.unsqueeze(0)
+                frame_ids = list(meta_rgb.get("frame_ids") or [])
+                secs = meta_rgb.get("stamp_sec_list", meta_rgb.get("stamp_sec", 0))
+                nsecs = meta_rgb.get(
+                    "stamp_nanosec_list", meta_rgb.get("stamp_nanosec", 0)
+                )
+                if isinstance(secs, int):
+                    secs = [secs] * n_cams
+                if isinstance(nsecs, int):
+                    nsecs = [nsecs] * n_cams
+                secs = list(secs)
+                nsecs = list(nsecs)
+                for i, rgb in enumerate(rgb_or_list):
+                    cam_meta = dict(meta_rgb)
+                    cam_meta["n_cams"] = 1
+                    cam_meta["frame_id"] = frame_ids[i] if i < len(frame_ids) else ""
+                    cam_meta["stamp_sec"] = int(secs[i]) if i < len(secs) else 0
+                    cam_meta["stamp_nanosec"] = int(nsecs[i]) if i < len(nsecs) else 0
+                    name = _cam_short_name(cam_meta["frame_id"], i)
+                    _process_frame(
+                        stamp_key,
+                        cam_meta,
+                        rgb,
+                        feat_event,
+                        cam_name=name,
+                        hs_slice=hs_all[i],
+                    )
+            else:
+                _process_frame(stamp_key, meta_rgb, rgb_or_list, feat_event)
 
     ros.destroy_node()
     if rclpy.ok():

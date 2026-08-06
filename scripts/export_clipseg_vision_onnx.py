@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Export CLIPSeg vision tower (+ extract_layers stack) to fixed-shape ONNX.
 
-Matches perception_models.clipseg.shared encoder output for batch=1:
-  input  pixel_values  [1,3,res,res]
-  output hidden_states [L,S,D]   (L = len(extract_layers))
+  input  pixel_values  [batch,3,res,res]
+  output hidden_states [batch,L,S,D]  (or [L,S,D] when batch=1)
 
 Example:
-  python3 scripts/export_clipseg_vision_onnx.py \\
-    --output /root/colcon_ws/src/perception_models/data/clipseg_vision_rd16_224.onnx
+  python3 scripts/export_clipseg_vision_onnx.py --batch 3 \\
+    --output .../clipseg_vision_rd16_224_b3.onnx
 """
 
 from __future__ import annotations
@@ -21,12 +20,11 @@ from transformers import CLIPSegForImageSegmentation
 
 
 class VisionExtract(nn.Module):
-    """Vision model → stacked selected hidden states [L,S,D]."""
-
-    def __init__(self, vision_model: nn.Module, extract_layers: list[int]):
+    def __init__(self, vision_model: nn.Module, extract_layers: list[int], batch: int):
         super().__init__()
         self.vision = vision_model
         self.extract = list(extract_layers)
+        self.batch = int(batch)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         vo = self.vision(
@@ -34,40 +32,38 @@ class VisionExtract(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-        # hidden_states[0] = embeddings; extract indices are 0-based into blocks.
-        layers = [
-            vo.hidden_states[i + 1].squeeze(0).contiguous() for i in self.extract
-        ]
-        return torch.stack(layers, dim=0)
+        layers = [vo.hidden_states[i + 1].contiguous() for i in self.extract]
+        stacked = torch.stack(layers, dim=1)  # [N,L,S,D]
+        if self.batch == 1:
+            return stacked.squeeze(0)
+        return stacked
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default="CIDAS/clipseg-rd16")
     ap.add_argument("--input-res", type=int, default=224)
-    ap.add_argument(
-        "--output",
-        type=Path,
-        default=Path(__file__).resolve().parents[1]
-        / "data"
-        / "clipseg_vision_rd16_224.onnx",
-    )
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--output", type=Path, default=None)
     ap.add_argument("--opset", type=int, default=17)
     args = ap.parse_args()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.output is None:
+        stem = f"clipseg_vision_rd16_{args.input_res}"
+        if args.batch > 1:
+            stem += f"_b{args.batch}"
+        args.output = Path(__file__).resolve().parents[1] / "data" / f"{stem}.onnx"
 
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     print(f"Loading {args.model} ...")
     model = CLIPSegForImageSegmentation.from_pretrained(args.model).eval()
     extract = list(model.extract_layers)
-    wrap = VisionExtract(model.clip.vision_model, extract).eval().cpu()
-
-    dummy = torch.zeros(1, 3, args.input_res, args.input_res, dtype=torch.float32)
+    wrap = VisionExtract(model.clip.vision_model, extract, args.batch).eval().cpu()
+    dummy = torch.zeros(args.batch, 3, args.input_res, args.input_res, dtype=torch.float32)
     with torch.inference_mode():
         out = wrap(dummy)
-    print(f"extract_layers={extract}  output shape={tuple(out.shape)}")
-
-    print(f"Exporting ONNX opset={args.opset} -> {args.output}")
+    print(f"extract_layers={extract} batch={args.batch} output={tuple(out.shape)}")
+    print(f"Exporting ONNX -> {args.output}")
     torch.onnx.export(
         wrap,
         dummy,
@@ -78,7 +74,7 @@ def main():
         do_constant_folding=True,
         dynamo=False,
     )
-    print(f"wrote {args.output}  ({args.output.stat().st_size / 1e6:.1f} MB)")
+    print("done")
 
 
 if __name__ == "__main__":
