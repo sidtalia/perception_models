@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
-"""Dora node: FiLM + optional SAM refine with CUDA streams.
+"""Dora-only: ClipSeg FiLM ∥ NanoSAM encode (CUDA streams), then SAM decode.
 
-Consumes CLIPSeg features + RGB from clipseg_encoder. Always runs FiLM decode
-and can publish coarse traversability from those probs (independent of NanoSAM).
-When NanoSAM is enabled, FiLM decode and SAM image encode are enqueued on *two
-CUDA streams* so they can overlap; then **two** mask decodes share that encode:
+No ROS. Optional Dora viz (``dora_viz``). E2E = done − ``t_src_perf``.
 
-  * nav  — CLIPSeg trav/nontrav CCs → refined_traversability
-  * manip — YOLO person/object boxes → refined_people_mask (when yolo_owns_people)
-
-Dataflow: clipseg_encoder -> seg_refine (this node) -> ROS.
+For N cams: enqueue ``decode_probs_batch`` on stream_film and
+``encode_tensor`` on stream_sam so they overlap; then ``decode_multi``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
+import cv2
 import numpy as np
-import rclpy
-from builtin_interfaces.msg import Time
-from cv_bridge import CvBridge
-from rclpy.node import Node as RosNode
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
-from std_msgs.msg import Header, String
+import pyarrow as pa
 import torch
 
 from dora import Node
@@ -34,20 +26,16 @@ from perception_models.clipseg.shared import (
     load_seg_config,
     prompt_layout_from_config,
 )
+from perception_models.clipseg.trt import TrtFilmDecoder, load_clipseg_film_engine
 from perception_models.cuda_ipc import unpack_arrow_f16, unpack_cuda_tensor
-from perception_models.utils import to_image
-from perception_models.sam_box_merge import (
-    clipseg_nav_boxes,
-    parse_yolo_detections_json,
-    yolo_manip_boxes,
-)
 from perception_models.multicam_rgb_batch import unpack_rgb_batch
+from perception_models.nanosam_trt import NanoSamDecoder, NanoSamEncoder
+from perception_models.sam_box_merge import clipseg_nav_boxes
 from perception_models.seg_ops import (
     blend_overlay,
-    labels_to_boxes,
+    labels_to_boxes_batch,
     labels_to_color,
     pack_traversability_rgb,
-    probs_to_labels,
     traversability_colors_from_config,
 )
 
@@ -66,7 +54,7 @@ def _feature_shape(meta: dict) -> tuple[int, ...]:
 
 def _open_features(event, *, non_blocking: bool = False) -> torch.Tensor:
     meta = event["metadata"]
-    mode = str(meta.get("feature_mode", "torch_cuda_ipc"))
+    mode = str(meta.get("feature_mode", "arrow_f16"))
     shape = _feature_shape(meta)
 
     if mode == "torch_cuda_ipc":
@@ -95,6 +83,55 @@ def _union(refined: torch.Tensor, idxs) -> torch.Tensor:
     return refined[sel].amax(dim=0)
 
 
+class _PrintLogger:
+    _prefix = "dora_seg_refine"
+
+    def info(self, msg: str) -> None:
+        print(f"[{self._prefix}] {msg}", flush=True)
+
+    def warning(self, msg: str) -> None:
+        print(f"[{self._prefix}] WARNING: {msg}", flush=True)
+
+    def warn(self, msg: str) -> None:
+        self.warning(msg)
+
+    def get_logger(self) -> _PrintLogger:
+        return self
+
+
+def _t_src_perf(meta: dict) -> float | None:
+    v = meta.get("t_src_perf")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _e2e_stats(samples: list[float]) -> dict:
+    if not samples:
+        return {
+            "n": 0,
+            "mean_ms": 0.0,
+            "median_ms": 0.0,
+            "p90_ms": 0.0,
+            "min_ms": 0.0,
+            "max_ms": 0.0,
+            "samples_ms": [],
+        }
+    arr = np.asarray(samples, dtype=np.float64)
+    return {
+        "n": int(arr.size),
+        "mean_ms": float(arr.mean()),
+        "median_ms": float(np.median(arr)),
+        "p90_ms": float(np.percentile(arr, 90)),
+        "min_ms": float(arr.min()),
+        "max_ms": float(arr.max()),
+        "samples_ms": [float(x) for x in samples],
+    }
+
+
 def main():
     cfg = load_seg_config()
     if not torch.cuda.is_available():
@@ -102,23 +139,115 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     dora = Node()
-    rclpy.init()
-    ros = RosNode("dora_seg_refine")
-    bridge = CvBridge()
+    logger = _PrintLogger()
+    log = logger.info
 
-    def log(msg: str):
-        ros.get_logger().info(msg)
+    dora_viz = bool(cfg.get("dora_viz", False))
+    e2e_samples: list[float] = []
+    e2e_log_n = 0
+    e2e_log_every = max(1, int(cfg.get("e2e_log_every", 10)))
+
+    def _record_e2e(meta_rgb: dict) -> float | None:
+        nonlocal e2e_log_n
+        t0 = _t_src_perf(meta_rgb)
+        if t0 is None:
+            return None
+        e2e_ms = (time.perf_counter() - t0) * 1000.0
+        e2e_samples.append(e2e_ms)
+        e2e_log_n += 1
+        if e2e_log_n >= e2e_log_every:
+            st = _e2e_stats(e2e_samples)
+            log(
+                f"[e2e ms] n={st['n']} median={st['median_ms']:.1f} "
+                f"mean={st['mean_ms']:.1f} p90={st['p90_ms']:.1f} last={e2e_ms:.1f}"
+            )
+            e2e_log_n = 0
+            e2e_path = str(cfg.get("e2e_latency_json", "") or "").strip()
+            if e2e_path:
+                with open(e2e_path, "w", encoding="utf-8") as f:
+                    json.dump(st, f, indent=2)
+        return e2e_ms
+
+    def _dora_image_meta(meta_rgb: dict, *, e2e_ms: float | None = None) -> dict:
+        out = {
+            "width": int(meta_rgb["width"]),
+            "height": int(meta_rgb["height"]),
+            "encoding": "rgb8",
+            "n_cams": int(meta_rgb.get("n_cams", 1)),
+            "frame_id": str(meta_rgb.get("frame_id", "")),
+        }
+        t0 = _t_src_perf(meta_rgb)
+        if t0 is not None:
+            out["t_src_perf"] = t0
+        if e2e_ms is not None:
+            out["e2e_ms"] = float(e2e_ms)
+        return out
+
+    def _send_dora_viz(
+        pending: dict[str, np.ndarray] | None,
+        meta_rgb: dict,
+        *,
+        e2e_ms: float | None,
+    ) -> None:
+        if not dora_viz or not pending:
+            return
+        meta_base = _dora_image_meta(meta_rgb, e2e_ms=e2e_ms)
+        if "trav" in pending:
+            trav = np.ascontiguousarray(pending["trav"], dtype=np.uint8)
+            dora.send_output(
+                "trav",
+                pa.array(trav.reshape(-1), type=pa.uint8()),
+                meta_base,
+            )
+        if "overlay" in pending:
+            ov = np.ascontiguousarray(pending["overlay"], dtype=np.uint8)
+            dora.send_output(
+                "overlay",
+                pa.array(ov.reshape(-1), type=pa.uint8()),
+                meta_base,
+            )
 
     layout = prompt_layout_from_config(cfg)
+    batch_n = max(1, int(cfg.get("clipseg_batch_n", 1)))
+    if bool(cfg.get("fanout_identical", False)):
+        batch_n = max(batch_n, len([n for n in (cfg.get("camera_names") or []) if n]))
     parts = ClipSegParts(
         str(cfg.get("model_name", "CIDAS/clipseg-rd16")),
         layout,
         input_res=int(cfg.get("input_res", 224)),
-        compile_mode=str(cfg.get("compile_mode", "reduce-overhead")),
+        compile_mode="none",
         device="cuda",
         logger=log,
     )
-    dec = parts.warmup_decoder(parts.build_decoder())
+    film_engine_path = str(cfg.get("clipseg_film_engine", "") or "").strip()
+    assert film_engine_path, (
+        "clipseg_film_engine required (TRT-only FiLM); build with "
+        "scripts/build_clipseg_film_engine.sh"
+    )
+    assert os.path.isfile(film_engine_path), (
+        f"clipseg_film_engine not found: {film_engine_path}"
+    )
+    log(f"Loading CLIPSeg FiLM TRT: {film_engine_path}")
+    film_eng = load_clipseg_film_engine(film_engine_path)
+    dec = TrtFilmDecoder(film_eng)
+    # Touch once so binding / context alloc is off the hot path.
+    with torch.inference_mode():
+        try:
+            hs_shape = [int(d) for d in film_eng.engine.get_tensor_shape("stacked_hs")]
+        except Exception:  # noqa: BLE001
+            hs_shape = [
+                batch_n,
+                len(parts.extract),
+                (parts.res // 16) ** 2 + 1,
+                768,
+            ]
+        if hs_shape[0] <= 0:
+            hs_shape[0] = batch_n
+        dummy_hs = torch.zeros(*hs_shape, device="cuda", dtype=torch.float32)
+        _ = dec(dummy_hs, parts.cond)
+        del dummy_hs, _
+    torch.cuda.synchronize()
+    log("CLIPSeg FiLM TRT warmup complete.")
 
     aggregate = str(cfg.get("aggregate", "max")).lower()
     threshold = float(cfg.get("threshold", 0.3))
@@ -127,17 +256,16 @@ def main():
     group_has_prompts = [len(idx) > 0 for idx in layout.group_index]
     viz_overlay = bool(cfg.get("viz_overlay", False))
     overlay_alpha = float(cfg.get("overlay_alpha", 0.5))
-    labels_topic = str(cfg.get("labels_topic", "/segmentation/labels"))
-    use_streams = bool(cfg.get("use_cuda_streams", True))
-
-    labels_pub = ros.create_publisher(Image, labels_topic, qos_profile_sensor_data)
-    overlay_pub = (
-        ros.create_publisher(
-            Image, str(cfg.get("overlay_topic", "/segmentation/overlay")), qos_profile_sensor_data
-        )
-        if viz_overlay
-        else None
-    )
+    sam_overlay = bool(cfg.get("sam_overlay", False))
+    # When sam_overlay paints trav into overlay, skip a second full-frame Dora hop
+    # unless explicitly requested (halves Rerun / Arrow bandwidth).
+    viz_send_trav = bool(cfg.get("viz_send_trav", not sam_overlay))
+    viz_min_interval_ms = float(cfg.get("viz_min_interval_ms", 0) or 0)
+    last_viz_t = 0.0
+    # One worker: pack stays on the GPU thread; Dora→Rerun send can lag without
+    # blocking the next frame (drop if previous send still in flight).
+    viz_pool = ThreadPoolExecutor(max_workers=1) if dora_viz else None
+    viz_fut = None
 
     positive_groups = [int(x) for x in cfg.get("positive_groups", [0])]
     negative_groups = [int(x) for x in cfg.get("negative_groups", [1])]
@@ -146,136 +274,53 @@ def main():
         [*positive_groups, *negative_groups, *people_groups, layout.n_groups - 1],
         default=0,
     ) + 1
-
-    # When YOLO-World owns people, CLIPSeg skips people prompts/CCs; YOLO boxes
-    # feed NanoSAM for refined_people_mask.
-    yolo_owns_people = bool(cfg.get("yolo_owns_people", False))
-    yolo_det_topic = str(
-        cfg.get("yolo_detections_topic", "/yolo_world/detections")
-    ).strip()
-    yolo_object_group = cfg.get("yolo_object_group_idx", None)
-    if yolo_object_group is not None:
-        yolo_object_group = int(yolo_object_group)
     people_group_idx = int(people_groups[0]) if people_groups else max(0, n_groups - 1)
-    latest_yolo: dict = {"dets": [], "stamp": 0.0}
 
-    def _on_yolo_dets(msg: String):
-        try:
-            latest_yolo["dets"] = parse_yolo_detections_json(msg.data)
-            latest_yolo["stamp"] = time.time()
-        except Exception as exc:  # noqa: BLE001
-            ros.get_logger().warning(f"yolo detections parse: {exc}")
-
-    # Dual-decode NanoSAM: subscribe when YOLO owns people (launch sets this when
-    # yolo_world.enabled). Topic default alone must not force a subscription.
-    if yolo_owns_people:
-        ros.create_subscription(
-            String, yolo_det_topic, _on_yolo_dets, 10
-        )
-        log(
-            f"NanoSAM dual-decode: YOLO dets on {yolo_det_topic} "
-            f"(owns_people={yolo_owns_people}, people_idx={people_group_idx})"
+    enc_path = str(cfg.get("sam_image_encoder", "") or "").strip()
+    dec_path = str(cfg.get("sam_mask_decoder", "") or "").strip()
+    if not enc_path or not dec_path:
+        raise RuntimeError(
+            "sam_image_encoder and sam_mask_decoder required (batched TRT)"
         )
 
-    # Coarse FiLM traversability — independent of NanoSAM.
-    # Multicam: also publish /segmentation/{cam}/coarse_traversability.
-    publish_coarse = bool(cfg.get("publish_coarse_traversability", True))
-    coarse_trav_pub = coarse_people_pub = None
-    coarse_trav_pubs: dict = {}
-    if publish_coarse:
-        coarse_trav_pub = ros.create_publisher(
-            Image,
-            str(
-                cfg.get(
-                    "coarse_traversability_topic",
-                    "/segmentation/coarse_traversability",
-                )
-            ),
-            qos_profile_sensor_data,
-        )
-        coarse_people_pub = ros.create_publisher(
-            Image,
-            str(
-                cfg.get(
-                    "coarse_people_mask_topic",
-                    "/segmentation/coarse_people_mask",
-                )
-            ),
-            qos_profile_sensor_data,
-        )
-        for name in cfg.get("camera_names") or ["front", "left", "right"]:
-            coarse_trav_pubs[str(name)] = ros.create_publisher(
-                Image,
-                f"/segmentation/{name}/coarse_traversability",
-                qos_profile_sensor_data,
-            )
-
-    sam_enabled = bool(cfg.get("sam_node", False))
-    sam_encoder = sam_decoder = None
-    trav_pub = people_pub = sam_overlay_pub = None
     sam_min_area = float(cfg.get("sam_min_area", 0.002))
     sam_max_boxes_nav = int(cfg.get("sam_max_boxes", 6))
-    sam_max_boxes_manip = int(
-        cfg.get("sam_max_boxes_manip", cfg.get("sam_max_boxes", 6))
+    # Cap decoder CUDA buffers (multicam × max boxes; TRT engines usually ≤16).
+    sam_dec_max_k = max(
+        sam_max_boxes_nav,
+        sam_max_boxes_nav * max(1, batch_n),
+        int(cfg.get("sam_decoder_max_batch", 16)),
     )
+    profile = os.environ.get("PROFILE", "0") == "1" or bool(cfg.get("profile", False))
+    if profile:
+        os.environ["PROFILE"] = "1"
+    log("Loading NanoSAM (TensorRT) ...")
+    sam_encoder = NanoSamEncoder(
+        enc_path,
+        image_encoder_size=int(cfg.get("sam_image_size", 512)),
+        device="cuda",
+        logger=logger,
+    )
+    sam_decoder = NanoSamDecoder(
+        dec_path,
+        orig_image_encoder_size=int(cfg.get("sam_image_size", 512)),
+        device="cuda",
+        logger=logger,
+        max_batch_k=sam_dec_max_k,
+    )
+    stream_film = torch.cuda.Stream()
+    stream_sam = torch.cuda.Stream()
 
-    stream_film = stream_sam = None
-    if sam_enabled:
-        from perception_models.nanosam_trt import NanoSamDecoder, NanoSamEncoder
-
-        log("Loading NanoSAM (TensorRT) ...")
-        sam_encoder = NanoSamEncoder(
-            str(cfg["sam_image_encoder"]),
-            image_encoder_size=int(cfg.get("sam_image_size", 512)),
-            device="cuda",
-            logger=ros.get_logger(),
-        )
-        sam_decoder = NanoSamDecoder(
-            str(cfg["sam_mask_decoder"]),
-            orig_image_encoder_size=int(cfg.get("sam_image_size", 512)),
-            device="cuda",
-            logger=ros.get_logger(),
-        )
-        if use_streams:
-            stream_film = torch.cuda.Stream()
-            stream_sam = torch.cuda.Stream()
-            log("CUDA streams: FiLM ∥ SAM-encode, then SAM-decode")
-
-        trav_pub = ros.create_publisher(
-            Image,
-            str(cfg.get("sam_traversability_topic", "/segmentation/refined_traversability")),
-            qos_profile_sensor_data,
-        )
-        people_pub = ros.create_publisher(
-            Image,
-            str(cfg.get("sam_people_mask_topic", "/segmentation/refined_people_mask")),
-            qos_profile_sensor_data,
-        )
-        if bool(cfg.get("sam_overlay", False)):
-            sam_overlay_pub = ros.create_publisher(
-                Image,
-                str(cfg.get("sam_overlay_topic", "/segmentation/refined_overlay")),
-                qos_profile_sensor_data,
-            )
-
-    profile = bool(cfg.get("profile", True))
-    profile_every = max(1, int(cfg.get("profile_every", 30)))
-    prof: dict[str, float] = {}
-    prof_n = 0
-    qlen = max(2, int(cfg.get("pipeline_queue_size", 3)))
-    rgb_buf: dict = {}
-    feat_buf: dict = {}
-
+    # Dora edges are queue_size=1 (latest-only). We still hold at most one unmatched
+    # rgb / features here because they arrive as separate INPUT events.
+    pending_rgb: tuple | None = None  # (stamp_key, meta, rgbs)
+    pending_feat: tuple | None = None  # (stamp_key, event)
+    camera_names = [str(n) for n in (cfg.get("camera_names") or []) if str(n)]
     log(
-        f"dora seg_refine up: features -> {labels_topic}"
-        + (f" coarse_trav={publish_coarse}" if publish_coarse else "")
-        + (" + NanoSAM" if sam_enabled else "")
-        + (f" streams={use_streams}" if sam_encoder is not None else "")
-        + (
-            f" sam_boxes_nav={sam_max_boxes_nav} manip={sam_max_boxes_manip}"
-            if sam_enabled
-            else ""
-        )
+        "dora seg_refine up (isolation) FiLM∥SAM-encode → decode_multi"
+        + f" sam_boxes={sam_max_boxes_nav}"
+        + (f" cams={camera_names}" if camera_names else "")
+        + f" dora_viz={'on' if dora_viz else 'off'}"
     )
 
     def _pack_trav_rgb(group_maps):
@@ -289,266 +334,211 @@ def main():
             threshold=trav_pack_threshold,
         )
 
-    def _publish_coarse(probs, rgb, hdr, *, cam_name: str | None = None):
-        if coarse_trav_pub is None and not coarse_trav_pubs:
-            return
-        rgb_np, _conf = _pack_trav_rgb(probs)
-        img = to_image(bridge, rgb_np, "rgb8", hdr)
-        if cam_name and cam_name in coarse_trav_pubs:
-            coarse_trav_pubs[cam_name].publish(img)
-        if coarse_trav_pub is not None and (cam_name is None or cam_name == "front"):
-            coarse_trav_pub.publish(img)
-        if not yolo_owns_people and coarse_people_pub is not None and (
-            cam_name is None or cam_name == "front"
-        ):
-            people = _union(probs, people_groups)
-            people_np = (people.cpu().numpy() >= 0.5).astype(np.uint8) * 255
-            coarse_people_pub.publish(to_image(bridge, people_np, "mono8", hdr))
+    def _scale_boxes_xyxy(boxes, sx: float, sy: float):
+        out = []
+        for box in boxes:
+            x0, y0, x1, y1 = box
+            out.append((x0 * sx, y0 * sy, x1 * sx, y1 * sy))
+        return out
 
-    def _publish_trav(refined_nav, rgb, hdr, *, people_mask=None):
-        """Publish refined traversability (+ optional overlay). People separate."""
-        rgb_np, nontrav = _pack_trav_rgb(refined_nav)
-        if trav_pub is not None:
-            trav_pub.publish(to_image(bridge, rgb_np, "rgb8", hdr))
-        if sam_overlay_pub is not None:
-            ov = blend_overlay(
-                rgb, rgb_np, nontrav.cpu().numpy(), overlay_alpha
+    def _nav_reqs_from_labels_batch(labels_np_all, h_full, w_full):
+        # CC / boxes at FiLM map res; scale into full image for SAM.
+        hl = int(labels_np_all.shape[1])
+        wl = int(labels_np_all.shape[2])
+        sx = float(w_full) / float(wl)
+        sy = float(h_full) / float(hl)
+        cand_lists = labels_to_boxes_batch(
+            labels_np_all,
+            n_groups,
+            sam_min_area,
+            max(sam_max_boxes_nav * 2, sam_max_boxes_nav),
+        )
+        out = []
+        for cands in cand_lists:
+            nav_classes, nav_boxes = clipseg_nav_boxes(
+                cands,
+                people_group_idx=people_group_idx,
+                drop_people=False,
+                max_boxes=sam_max_boxes_nav,
             )
+            if abs(sx - 1.0) > 1e-6 or abs(sy - 1.0) > 1e-6:
+                nav_boxes = _scale_boxes_xyxy(nav_boxes, sx, sy)
+            n_nav = max(
+                [*nav_classes, *positive_groups, *negative_groups, *people_groups],
+                default=0,
+            ) + 1
+            out.append((nav_classes, nav_boxes, n_nav, (h_full, w_full)))
+        return out
+
+    def _upsample_groups(groups_1ghw: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        x = groups_1ghw.unsqueeze(0)
+        if x.dtype != torch.float16:
+            x = x.to(dtype=torch.float16)
+        return F.interpolate(
+            x, size=(h, w), mode="bilinear", align_corners=False
+        ).clamp_(0.0, 1.0)[0]
+
+    def _front_viz(
+        rgb,
+        probs_lr,
+        labels_np,
+        conf_np,
+        refined_nav,
+        people_mask,
+        *,
+        h: int,
+        w: int,
+    ) -> dict[str, np.ndarray] | None:
+        if not dora_viz:
+            return None
+        pending: dict[str, np.ndarray] = {}
+        # Upsample FiLM maps only when trav/overlay still needs them.
+        need_film_full = refined_nav is None or viz_overlay
+        probs_full = None
+        if need_film_full and probs_lr is not None:
+            probs_full = _upsample_groups(probs_lr, h, w).float()
+        if viz_overlay:
+            if labels_np.shape[0] != h or labels_np.shape[1] != w:
+                labels_np = cv2.resize(
+                    labels_np, (w, h), interpolation=cv2.INTER_NEAREST
+                )
+                conf_np = cv2.resize(
+                    conf_np.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR
+                )
+            color = labels_to_color(labels_np, layout.n_groups)
+            pending["overlay"] = blend_overlay(rgb, color, conf_np, overlay_alpha)
+        pack_src = refined_nav if refined_nav is not None else probs_full
+        if pack_src is None:
+            return pending or None
+        rgb_np, nontrav = _pack_trav_rgb(pack_src)
+        if viz_send_trav:
+            pending["trav"] = rgb_np
+        if sam_overlay and refined_nav is not None:
+            # One D2H for blend weight (pack already synced rgb_np).
+            conf = nontrav.detach().float().cpu().numpy()
+            ov = blend_overlay(rgb, rgb_np, conf, overlay_alpha)
             if people_mask is not None:
-                pm = (people_mask.cpu().numpy() >= 0.5)
+                pm = people_mask.detach().float().cpu().numpy() >= 0.5
                 ov = ov.copy()
                 ov[pm, 2] = np.maximum(ov[pm, 2], 200)
-            sam_overlay_pub.publish(to_image(bridge, ov, "rgb8", hdr))
+            pending["overlay"] = ov
+        elif not pending and not viz_send_trav:
+            # Still emit trav if nothing else would be sent.
+            pending["trav"] = rgb_np
+        return pending or None
 
-    def _publish_people_mask(people_mask, hdr):
-        if people_pub is None or people_mask is None:
-            return
-        people_np = (people_mask.cpu().numpy() >= 0.5).astype(np.uint8) * 255
-        people_pub.publish(to_image(bridge, people_np, "mono8", hdr))
-
-    def _sam_dual_decode(sam_feat, labels_np, h, w, *, profile_into: dict | None):
-        """One encode's features → nav decode (+ optional manip decode).
-
-        Returns (refined_nav, people_mask_hw).
-        """
-        cands = labels_to_boxes(
-            labels_np, n_groups, sam_min_area, max(sam_max_boxes_nav * 2, sam_max_boxes_nav)
-        )
-        nav_classes, nav_boxes = clipseg_nav_boxes(
-            cands,
-            people_group_idx=people_group_idx,
-            drop_people=yolo_owns_people,
-            max_boxes=sam_max_boxes_nav,
-        )
-        n_nav = max(
-            [*nav_classes, *positive_groups, *negative_groups, *people_groups],
-            default=0,
-        ) + 1
-        refined_nav = sam_decoder.decode(
-            sam_feat, nav_classes, nav_boxes, n_nav, (h, w)
-        )
-        if profile_into is not None:
-            timing = sam_decoder.last_timing
-            profile_into["sam_decoder_nav"] = profile_into.get(
-                "sam_decoder_nav", 0.0
-            ) + float(timing.get("decoder_ms", 0.0))
-            profile_into["sam_n_boxes_nav"] = profile_into.get(
-                "sam_n_boxes_nav", 0.0
-            ) + float(timing.get("n_boxes", 0))
-            if str(timing.get("decoder_mode", "")) == "batched":
-                profile_into["sam_batched"] = profile_into.get("sam_batched", 0.0) + 1.0
-
-        if yolo_owns_people:
-            man_classes, man_boxes = yolo_manip_boxes(
-                latest_yolo["dets"],
-                people_group_idx=people_group_idx,
-                object_group_idx=yolo_object_group,
-                max_boxes=sam_max_boxes_manip,
-            )
-            n_man = max([*man_classes, people_group_idx], default=0) + 1
-            if man_boxes:
-                refined_man = sam_decoder.decode(
-                    sam_feat, man_classes, man_boxes, n_man, (h, w)
-                )
-                if profile_into is not None:
-                    timing = sam_decoder.last_timing
-                    profile_into["sam_decoder_manip"] = profile_into.get(
-                        "sam_decoder_manip", 0.0
-                    ) + float(timing.get("decoder_ms", 0.0))
-                    profile_into["sam_n_boxes_manip"] = profile_into.get(
-                        "sam_n_boxes_manip", 0.0
-                    ) + float(timing.get("n_boxes", 0))
-            else:
-                refined_man = torch.zeros(
-                    (n_man, h, w), device=refined_nav.device, dtype=torch.float32
-                )
-                if profile_into is not None:
-                    profile_into["sam_n_boxes_manip"] = profile_into.get(
-                        "sam_n_boxes_manip", 0.0
-                    )
-            return refined_nav, _union(refined_man, people_groups)
-
-        # Legacy: people CCs stay in nav decode when YOLO is off.
-        return refined_nav, _union(refined_nav, people_groups)
-
-    def _decode(hs, h, w, _feat_meta=None):
-        return parts.decode_probs(
-            hs, dec, height=h, width=w, aggregate=aggregate
-        )
-
-    def _process_frame(_stamp_key, meta_rgb, rgb, feat_event, *, cam_name=None, hs_slice=None):
-        nonlocal prof, prof_n
+    def _run_matched(meta_rgb: dict, rgbs: list, feat_event) -> None:
+        nonlocal last_viz_t, viz_fut
+        n_cams = len(rgbs)
         h = int(meta_rgb["height"])
         w = int(meta_rgb["width"])
-        hdr = Header()
-        hdr.stamp = Time(
-            sec=int(meta_rgb.get("stamp_sec", 0)),
-            nanosec=int(meta_rgb.get("stamp_nanosec", 0)),
-        )
-        hdr.frame_id = str(meta_rgb.get("frame_id", ""))
-        feat_meta = feat_event["metadata"]
-        feat_mode = str(feat_meta.get("feature_mode", "?"))
 
-        # --- NanoSAM dual-stream path: FiLM ∥ SAM-encode ---
-        if sam_encoder is not None and stream_film is not None and stream_sam is not None:
-            if profile:
-                torch.cuda.synchronize()
-                t_wall0 = time.perf_counter()
-                ev_film0 = torch.cuda.Event(enable_timing=True)
-                ev_film1 = torch.cuda.Event(enable_timing=True)
-                ev_sam0 = torch.cuda.Event(enable_timing=True)
-                ev_sam1 = torch.cuda.Event(enable_timing=True)
+        hs = _open_features(feat_event, non_blocking=True)
+        if hs.dim() == 3:
+            hs = hs.unsqueeze(0)
 
-            with torch.cuda.stream(stream_film):
-                if profile:
-                    ev_film0.record(stream_film)
-                if hs_slice is not None:
-                    hs = hs_slice
-                else:
-                    hs = _open_features(feat_event, non_blocking=True)
-                    if hs.dim() == 4:
-                        hs = hs[0]
-                probs = _decode(hs, h, w, feat_meta)
-                if profile:
-                    ev_film1.record(stream_film)
-
-            sam_input_cpu = sam_encoder.preprocess(rgb)
-
-            with torch.cuda.stream(stream_sam):
-                if profile:
-                    ev_sam0.record(stream_sam)
-                sam_feat = sam_encoder.encode_tensor(sam_input_cpu, synchronize=False)
-                if profile:
-                    ev_sam1.record(stream_sam)
-
-            stream_film.synchronize()
-            labels_np, conf_np = probs_to_labels(probs, threshold)
-            labels_pub.publish(to_image(bridge, labels_np, "mono8", hdr))
-            if overlay_pub is not None:
-                color = labels_to_color(labels_np, layout.n_groups)
-                overlay = blend_overlay(rgb, color, conf_np, overlay_alpha)
-                overlay_pub.publish(to_image(bridge, overlay, "rgb8", hdr))
-            _publish_coarse(probs, rgb, hdr, cam_name=cam_name)
-
-            rclpy.spin_once(ros, timeout_sec=0.0)
-            stream_sam.synchronize()
-
-            frame_prof: dict[str, float] = {}
-            refined_nav, people_mask = _sam_dual_decode(
-                sam_feat, labels_np, h, w, profile_into=frame_prof if profile else None
+        t0 = time.perf_counter()
+        with torch.cuda.stream(stream_film):
+            # Native FiLM res for labels/boxes; upsample only for viz/trav.
+            probs_all = parts.decode_probs_batch(hs, dec, aggregate=aggregate)
+        sam_input = sam_encoder.preprocess_batch(rgbs)
+        with torch.cuda.stream(stream_sam):
+            sam_feats_all = sam_encoder.encode_tensor(
+                sam_input, synchronize=False
             )
-            _publish_trav(refined_nav, rgb, hdr, people_mask=people_mask)
-            _publish_people_mask(people_mask, hdr)
+        with torch.cuda.stream(stream_film):
+            maxv, arg = probs_all.max(dim=1)
+            labels_u8 = torch.where(
+                maxv >= threshold,
+                (arg + 1).to(torch.uint8),
+                torch.zeros_like(arg, dtype=torch.uint8),
+            )
+            labels_np_all = labels_u8.cpu().numpy()
+            conf_np_all = maxv.float().cpu().numpy()
+        nav_reqs = _nav_reqs_from_labels_batch(labels_np_all, h, w)
+        stream_sam.synchronize()
+        t1 = time.perf_counter()
+        if profile:
+            print(f"FiLM||SAM encode time: {(t1 - t0) * 1000.0} ms", flush=True)
 
-            if profile:
-                torch.cuda.synchronize()
-                wall_ms = (time.perf_counter() - t_wall0) * 1000.0
-                film_ms = float(ev_film0.elapsed_time(ev_film1))
-                sam_enc_ms = float(ev_sam0.elapsed_time(ev_sam1))
-                dec_ms = float(frame_prof.get("sam_decoder_nav", 0.0)) + float(
-                    frame_prof.get("sam_decoder_manip", 0.0)
-                )
-                serial_fe = film_ms + sam_enc_ms
-                overlap_ms = max(0.0, serial_fe - (wall_ms - dec_ms))
-                prof["film_decode"] = prof.get("film_decode", 0.0) + film_ms
-                prof["sam_encoder"] = prof.get("sam_encoder", 0.0) + sam_enc_ms
-                prof["stream_wall"] = prof.get("stream_wall", 0.0) + wall_ms
-                prof["stream_overlap"] = prof.get("stream_overlap", 0.0) + overlap_ms
-                for k, v in frame_prof.items():
-                    prof[k] = prof.get(k, 0.0) + float(v)
+        t2 = time.perf_counter()
+        sam_nav_all = sam_decoder.decode_multi(sam_feats_all, nav_reqs)
+        t3 = time.perf_counter()
+        if profile:
+            tim = sam_decoder.last_timing
+            print(
+                f"SAM decode time: {(t3 - t2) * 1000.0} ms "
+                f"(trt={tim.get('trt_ms', 0):.1f} upscale={tim.get('upscale_ms', 0):.1f} "
+                f"boxes={tim.get('n_boxes', 0)} upscales={tim.get('n_upscales', 0)})",
+                flush=True,
+            )
 
-            rclpy.spin_once(ros, timeout_sec=0.0)
-            if profile:
-                prof_n += 1
-                if prof_n >= profile_every:
-                    parts_s = " ".join(
-                        f"{k}={v / prof_n:5.1f}" for k, v in sorted(prof.items())
-                    )
-                    log(f"[timing ms/frame n={prof_n} mode={feat_mode}] {parts_s}")
-                    prof, prof_n = {}, 0
+        # Stamp e2e before any viz pack / Dora→Rerun send so viewer cost does not
+        # inflate the pipeline number (and so backpressure is visible separately).
+        e2e_ms = _record_e2e(meta_rgb)
+
+        if not dora_viz or viz_pool is None:
             return
 
-        # --- Serial path (SAM off, or use_cuda_streams=false) ---
-        if profile:
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+        now = time.perf_counter()
+        if viz_min_interval_ms > 0 and (now - last_viz_t) * 1000.0 < viz_min_interval_ms:
+            return
+        # Never stall the GPU loop on a slow Rerun/Dora consumer.
+        if viz_fut is not None and not viz_fut.done():
+            return
 
-        if hs_slice is not None:
-            hs = hs_slice
-        else:
-            hs = _open_features(feat_event)
-            if hs.dim() == 4:
-                hs = hs[0]
-        if profile:
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            prof["feature_open"] = prof.get("feature_open", 0.0) + (t1 - t0) * 1000.0
+        frame_ids = list(meta_rgb.get("frame_ids") or [])
+        front_i = 0
+        for i, fid in enumerate(frame_ids):
+            if _cam_short_name(str(fid), i) == "front":
+                front_i = i
+                break
+        refined_front = sam_nav_all[front_i]
+        people_front = _union(refined_front, people_groups)
+        labels_np = np.ascontiguousarray(labels_np_all[front_i])
+        conf_np = np.ascontiguousarray(conf_np_all[front_i])
+        rgb_front = np.ascontiguousarray(rgbs[front_i])
+        # Minimal GPU sync: stage maps to CPU, pack/blend/send on the worker.
+        maps_cpu = refined_front.detach().to(dtype=torch.float32, device="cpu")
+        people_cpu = people_front.detach().to(dtype=torch.float32, device="cpu")
+        probs_lr_cpu = (
+            probs_all[front_i].detach().to(dtype=torch.float16, device="cpu")
+            if (refined_front is None or viz_overlay)
+            else None
+        )
+        cam_meta = dict(meta_rgb)
+        cam_meta["n_cams"] = n_cams
+        if frame_ids:
+            cam_meta["frame_id"] = str(frame_ids[front_i])
 
-        probs = _decode(hs, h, w, feat_meta)
-        labels_np, conf_np = probs_to_labels(probs, threshold)
-        if profile:
-            torch.cuda.synchronize()
-            prof["film_decode"] = (
-                prof.get("film_decode", 0.0) + (time.perf_counter() - t1) * 1000.0
+        def _viz_job():
+            pending = _front_viz(
+                rgb_front,
+                probs_lr_cpu,
+                labels_np,
+                conf_np,
+                maps_cpu,
+                people_cpu,
+                h=h,
+                w=w,
             )
+            _send_dora_viz(pending, cam_meta, e2e_ms=e2e_ms)
 
-        labels_pub.publish(to_image(bridge, labels_np, "mono8", hdr))
-        if overlay_pub is not None:
-            color = labels_to_color(labels_np, layout.n_groups)
-            overlay = blend_overlay(rgb, color, conf_np, overlay_alpha)
-            overlay_pub.publish(to_image(bridge, overlay, "rgb8", hdr))
-        _publish_coarse(probs, rgb, hdr, cam_name=cam_name)
-
-        if sam_encoder is not None and sam_decoder is not None:
-            if profile:
-                torch.cuda.synchronize()
-                t_e = time.perf_counter()
-            sam_feat = sam_encoder.encode(rgb)
-            if profile:
-                torch.cuda.synchronize()
-                prof["sam_encoder"] = (
-                    prof.get("sam_encoder", 0.0) + (time.perf_counter() - t_e) * 1000.0
-                )
-            rclpy.spin_once(ros, timeout_sec=0.0)
-            frame_prof: dict[str, float] = {}
-            refined_nav, people_mask = _sam_dual_decode(
-                sam_feat, labels_np, h, w, profile_into=frame_prof if profile else None
-            )
-            _publish_trav(refined_nav, rgb, hdr, people_mask=people_mask)
-            _publish_people_mask(people_mask, hdr)
-            if profile:
-                for k, v in frame_prof.items():
-                    prof[k] = prof.get(k, 0.0) + float(v)
-
-        rclpy.spin_once(ros, timeout_sec=0.0)
+        viz_fut = viz_pool.submit(_viz_job)
+        last_viz_t = now
         if profile:
-            prof_n += 1
-            if prof_n >= profile_every:
-                parts_s = " ".join(
-                    f"{k}={v / prof_n:5.1f}" for k, v in sorted(prof.items())
-                )
-                log(f"[timing ms/frame n={prof_n} mode={feat_mode}] {parts_s}")
-                prof, prof_n = {}, 0
+            print("viz staged async (drop-if-busy)", flush=True)
+
+    def _drop_feat(slot: tuple | None) -> None:
+        if slot is None:
+            return
+        try:
+            _ = _open_features(slot[1])
+            del _
+        except Exception:  # noqa: BLE001
+            pass
 
     for event in dora:
         if event is None or event.get("type") == "STOP":
@@ -558,78 +548,60 @@ def main():
 
         eid = event["id"]
         meta = event["metadata"]
-        stamp_key = (int(meta.get("stamp_sec", 0)), int(meta.get("stamp_nanosec", 0)))
+
+        def _stamp_scalar(v, default: int = 0) -> int:
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else default
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        stamp_key = (
+            _stamp_scalar(meta.get("stamp_sec", meta.get("stamp_sec0", 0))),
+            _stamp_scalar(meta.get("stamp_nanosec", meta.get("stamp_nanosec0", 0))),
+        )
 
         if eid == "rgb":
-            n_cams = int(meta.get("n_cams", 1))
-            hh = int(meta["height"])
-            ww = int(meta["width"])
-            if n_cams > 1:
-                rgbs = unpack_rgb_batch(event["value"], meta)
-                rgb_buf[stamp_key] = (meta, rgbs)
-            else:
-                flat = event["value"].to_numpy()
-                rgb = np.asarray(flat, dtype=np.uint8).reshape(hh, ww, 3)
-                rgb_buf[stamp_key] = (meta, np.ascontiguousarray(rgb))
-            while len(rgb_buf) > qlen:
-                rgb_buf.pop(next(iter(rgb_buf)))
+            rgbs = unpack_rgb_batch(event["value"], meta)
+            pending_rgb = (stamp_key, meta, rgbs)
         elif eid == "features":
-            feat_buf[stamp_key] = event
-            while len(feat_buf) > qlen:
-                old = next(iter(feat_buf))
-                try:
-                    _ = _open_features(feat_buf.pop(old))
-                    del _
-                except Exception:  # noqa: BLE001
-                    feat_buf.pop(old, None)
+            _drop_feat(pending_feat)
+            pending_feat = (stamp_key, event)
         else:
             continue
 
-        # Drain YOLO detections while waiting for matched frames.
-        if yolo_owns_people:
-            for _ in range(4):
-                rclpy.spin_once(ros, timeout_sec=0.0)
+        if (
+            pending_rgb is not None
+            and pending_feat is not None
+            and pending_rgb[0] == pending_feat[0]
+        ):
+            _, meta_rgb, rgbs = pending_rgb
+            _, feat_event = pending_feat
+            pending_rgb = None
+            pending_feat = None
+            _run_matched(meta_rgb, rgbs, feat_event)
 
-        if stamp_key in rgb_buf and stamp_key in feat_buf:
-            meta_rgb, rgb_or_list = rgb_buf.pop(stamp_key)
-            feat_event = feat_buf.pop(stamp_key)
-            n_cams = int(meta_rgb.get("n_cams", 1))
-            if n_cams > 1 and isinstance(rgb_or_list, list):
-                hs_all = _open_features(feat_event)
-                if hs_all.dim() == 3:
-                    hs_all = hs_all.unsqueeze(0)
-                frame_ids = list(meta_rgb.get("frame_ids") or [])
-                secs = meta_rgb.get("stamp_sec_list", meta_rgb.get("stamp_sec", 0))
-                nsecs = meta_rgb.get(
-                    "stamp_nanosec_list", meta_rgb.get("stamp_nanosec", 0)
-                )
-                if isinstance(secs, int):
-                    secs = [secs] * n_cams
-                if isinstance(nsecs, int):
-                    nsecs = [nsecs] * n_cams
-                secs = list(secs)
-                nsecs = list(nsecs)
-                for i, rgb in enumerate(rgb_or_list):
-                    cam_meta = dict(meta_rgb)
-                    cam_meta["n_cams"] = 1
-                    cam_meta["frame_id"] = frame_ids[i] if i < len(frame_ids) else ""
-                    cam_meta["stamp_sec"] = int(secs[i]) if i < len(secs) else 0
-                    cam_meta["stamp_nanosec"] = int(nsecs[i]) if i < len(nsecs) else 0
-                    name = _cam_short_name(cam_meta["frame_id"], i)
-                    _process_frame(
-                        stamp_key,
-                        cam_meta,
-                        rgb,
-                        feat_event,
-                        cam_name=name,
-                        hs_slice=hs_all[i],
-                    )
-            else:
-                _process_frame(stamp_key, meta_rgb, rgb_or_list, feat_event)
+    if viz_pool is not None:
+        if viz_fut is not None:
+            try:
+                viz_fut.result(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+        viz_pool.shutdown(wait=False)
 
-    ros.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
+    e2e_path = str(cfg.get("e2e_latency_json", "") or "").strip()
+    if e2e_samples:
+        st = _e2e_stats(e2e_samples)
+        log(
+            f"[e2e ms exit] n={st['n']} median={st['median_ms']:.1f} "
+            f"mean={st['mean_ms']:.1f} p90={st['p90_ms']:.1f} "
+            f"min={st['min_ms']:.1f} max={st['max_ms']:.1f}"
+        )
+        if e2e_path:
+            with open(e2e_path, "w", encoding="utf-8") as f:
+                json.dump(st, f, indent=2)
+            log(f"e2e latency JSON -> {e2e_path}")
 
 
 if __name__ == "__main__":

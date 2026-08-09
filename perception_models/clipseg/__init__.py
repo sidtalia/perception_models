@@ -10,7 +10,10 @@ __all__ = [
     "load_seg_config",
     "prompt_layout_from_config",
     "load_clipseg_vision_engine",
+    "load_clipseg_film_engine",
+    "TrtFilmDecoder",
     "trt_encode_hs",
+    "trt_decode_film",
 ]
 
 
@@ -26,7 +29,13 @@ def __getattr__(name: str):
         from perception_models.clipseg import shared as _shared
 
         return getattr(_shared, name)
-    if name in ("load_clipseg_vision_engine", "trt_encode_hs"):
+    if name in (
+        "load_clipseg_vision_engine",
+        "load_clipseg_film_engine",
+        "TrtFilmDecoder",
+        "trt_encode_hs",
+        "trt_decode_film",
+    ):
         from perception_models.clipseg import trt as _trt
 
         return getattr(_trt, name)

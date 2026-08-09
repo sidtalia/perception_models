@@ -30,8 +30,11 @@ def pack_rgb_batch(
         "height": h,
         "width": w,
         "frame_ids": list(frame_ids),
-        "stamp_sec": [int(x) for x in stamp_sec],
-        "stamp_nanosec": [int(x) for x in stamp_nanosec],
+        # Lists for multi-cam; scalars for Dora matching / single-cam refine.
+        "stamp_sec_list": [int(x) for x in stamp_sec],
+        "stamp_nanosec_list": [int(x) for x in stamp_nanosec],
+        "stamp_sec": int(stamp_sec[0]),
+        "stamp_nanosec": int(stamp_nanosec[0]),
         "stamp_sec0": int(stamp_sec[0]),
         "stamp_nanosec0": int(stamp_nanosec[0]),
         "frame_id": str(frame_ids[0]),

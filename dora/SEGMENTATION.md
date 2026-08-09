@@ -166,7 +166,18 @@ clipseg_batch_n: 3
 ```
 
 Encoder packs N RGB → Dora `rgb` + features `[N,L,S,D]`. Refine publishes
-`/segmentation/{name}/coarse_traversability`. Optional TRT batch=3:
+per-cam coarse **and** refined:
+
+```
+/segmentation/{name}/coarse_traversability
+/segmentation/{name}/refined_traversability
+/segmentation/{name}/refined_people_mask
+/segmentation/{name}/refined_overlay   # if sam_overlay
+/segmentation/{name}/labels
+```
+
+Global topics (`/segmentation/refined_*`, `/segmentation/labels`, …) still mirror
+the **front** cam for single-cam / mapper defaults. Optional TRT batch=3:
 
 ```bash
 bash scripts/build_clipseg_vision_engine.sh data CIDAS/clipseg-rd16 224 3

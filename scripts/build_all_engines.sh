@@ -23,8 +23,11 @@ DATA="${DATA:-${HOUND_SCRIPTS}/../data}"
 OPT_BATCH="${OPT_BATCH:-16}"
 MAX_BATCH="${MAX_BATCH:-32}"
 SKIP_CLIPSEG="${SKIP_CLIPSEG:-0}"
+SKIP_CLIPSEG_FILM="${SKIP_CLIPSEG_FILM:-0}"
 SKIP_NANOSAM="${SKIP_NANOSAM:-0}"
 SKIP_YOLO="${SKIP_YOLO:-0}"
+CLIPSEG_FILM_BATCH="${CLIPSEG_FILM_BATCH:-3}"
+CLIPSEG_FILM_PROMPTS="${CLIPSEG_FILM_PROMPTS:-9}"
 YOLO_MODEL="${YOLO_MODEL:-yolov8s-world.pt}"
 # shellcheck disable=SC2206
 YOLO_CLASSES=(${YOLO_CLASSES:-person chair door table bag})
@@ -40,24 +43,38 @@ echo "=========================================="
 
 if [[ "${SKIP_CLIPSEG}" != "1" ]]; then
   echo ""
-  echo ">>> [1/3] CLIPSeg vision ONNX → TensorRT FP16"
+  echo ">>> [1/4] CLIPSeg vision ONNX → TensorRT FP16"
   bash "${HOUND_SCRIPTS}/build_clipseg_vision_engine.sh" "${DATA}"
 else
-  echo ">>> [1/3] CLIPSeg SKIPPED"
+  echo ">>> [1/4] CLIPSeg vision SKIPPED"
+fi
+
+if [[ "${SKIP_CLIPSEG_FILM}" != "1" ]]; then
+  echo ""
+  echo ">>> [2/4] CLIPSeg FiLM decoder ONNX → TensorRT FP16"
+  bash "${HOUND_SCRIPTS}/build_clipseg_film_engine.sh" \
+    "${DATA}" "CIDAS/clipseg-rd16" "224" "${CLIPSEG_FILM_BATCH}" "${CLIPSEG_FILM_PROMPTS}"
+  # Also build batch=1 for single-cam.
+  if [[ "${CLIPSEG_FILM_BATCH}" != "1" ]]; then
+    bash "${HOUND_SCRIPTS}/build_clipseg_film_engine.sh" \
+      "${DATA}" "CIDAS/clipseg-rd16" "224" "1" "${CLIPSEG_FILM_PROMPTS}"
+  fi
+else
+  echo ">>> [2/4] CLIPSeg FiLM SKIPPED"
 fi
 
 if [[ "${SKIP_NANOSAM}" != "1" ]]; then
   echo ""
-  echo ">>> [2/3] NanoSAM 512 encoder + batched mask decoder"
+  echo ">>> [3/4] NanoSAM 512 encoder + batched mask decoder"
   bash "${HOUND_SCRIPTS}/build_nanosam_512_pair.sh" \
     "${DATA}" "${OPT_BATCH}" "${MAX_BATCH}"
 else
-  echo ">>> [2/3] NanoSAM SKIPPED"
+  echo ">>> [3/4] NanoSAM SKIPPED"
 fi
 
 if [[ "${SKIP_YOLO}" != "1" ]]; then
   echo ""
-  echo ">>> [3/3] YOLO-World stash embeddings → *_stashed.pt (torch FP16 runtime)"
+  echo ">>> [4/4] YOLO-World stash embeddings → *_stashed.pt (torch FP16 runtime)"
   echo "    (ONNX/TRT export is blocked on WorldModel adaptive_max_pool2d)"
   python3 "${HOUND_SCRIPTS}/export_yolo_world.py" \
     --model "${YOLO_MODEL}" \
@@ -65,7 +82,7 @@ if [[ "${SKIP_YOLO}" != "1" ]]; then
     --out-dir "${DATA}" \
     --format pt
 else
-  echo ">>> [3/3] YOLO-World SKIPPED"
+  echo ">>> [4/4] YOLO-World SKIPPED"
 fi
 
 echo ""
@@ -75,6 +92,7 @@ ls -lh "${DATA}"/*.{engine,onnx,pt} 2>/dev/null || ls -lh "${DATA}" | tail -20
 echo ""
 echo "Point SSoT (hound_core/config/SSoT.yaml) at:"
 echo "  segmentation.clipseg_vision_engine: ${DATA}/clipseg_vision_rd16_224.engine"
+echo "  segmentation.clipseg_film_engine:   ${DATA}/clipseg_film_rd16_224_b1_p${CLIPSEG_FILM_PROMPTS}.engine"
 echo "  segmentation.sam_image_encoder:     ${DATA}/resnet18_image_encoder_512.engine"
 echo "  segmentation.sam_mask_decoder:      ${DATA}/mobile_sam_mask_decoder_batched_512.engine"
 echo "  yolo_world.model:                   ${DATA}/yolov8s-world_stashed.pt  # if exported"

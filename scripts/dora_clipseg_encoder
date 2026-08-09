@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-from perception_models.dora_clipseg_encoder import main
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _dora_boot import load_main
 
 if __name__ == "__main__":
-    main()
+    load_main("dora_clipseg_encoder.py")()

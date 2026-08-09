@@ -122,12 +122,55 @@ def extract_boxes(binary_np: np.ndarray, min_area: float, max_boxes: int):
 def labels_to_boxes(
     labels: np.ndarray, n_groups: int, min_area_frac: float, max_boxes: int
 ):
-    """Label map [H,W] (0=none, i=group i-1) -> box prompts for SAM refinement."""
+    """Label map [H,W] (0=none, i=group i-1) -> box prompts for SAM refinement.
+
+    Only runs CC on labels that appear (skips empty groups).
+    """
     h, w = labels.shape
-    binary = np.zeros((n_groups, h, w), dtype=np.uint8)
-    for i in range(n_groups):
-        binary[i] = (labels == (i + 1)).astype(np.uint8)
-    return extract_boxes(binary, min_area_frac * h * w, max_boxes)
+    min_area = float(min_area_frac) * h * w
+    cands = []
+    for lab in np.unique(labels):
+        lab_i = int(lab)
+        if lab_i <= 0 or lab_i > n_groups:
+            continue
+        gi = lab_i - 1
+        binary = (labels == lab_i).astype(np.uint8)
+        ncomp, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        for c in range(1, ncomp):
+            area = int(stats[c, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            x = int(stats[c, cv2.CC_STAT_LEFT])
+            y = int(stats[c, cv2.CC_STAT_TOP])
+            bw = int(stats[c, cv2.CC_STAT_WIDTH])
+            bh = int(stats[c, cv2.CC_STAT_HEIGHT])
+            cands.append((gi, area, (x, y, x + bw, y + bh)))
+    cands.sort(key=lambda t: t[1], reverse=True)
+    return cands[:max_boxes]
+
+
+def labels_to_boxes_batch(
+    labels_np_all: np.ndarray,
+    n_groups: int,
+    min_area_frac: float,
+    max_boxes: int,
+):
+    """Batched ``labels_to_boxes`` over ``[N,H,W]`` (thread pool when N>1)."""
+    n = int(labels_np_all.shape[0])
+    if n <= 1:
+        return [
+            labels_to_boxes(labels_np_all[i], n_groups, min_area_frac, max_boxes)
+            for i in range(n)
+        ]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(i: int):
+        return labels_to_boxes(
+            labels_np_all[i], n_groups, min_area_frac, max_boxes
+        )
+
+    with ThreadPoolExecutor(max_workers=min(n, 4)) as pool:
+        return list(pool.map(_one, range(n)))
 
 
 def blend_overlay(
