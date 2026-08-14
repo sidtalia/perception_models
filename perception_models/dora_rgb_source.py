@@ -68,7 +68,18 @@ def main():
     cfg = load_seg_config()
     dora = Node()
 
+    ros_io = bool(cfg.get("ros_io", False)) or bool(cfg.get("use_ros_edge", False))
     bag_path = Path(str(cfg.get("bag_path", "") or "")).expanduser()
+
+    # Live ROS path: encoder ApproxSync owns RGB. Stay alive so Dora does not
+    # tear down the dataflow when this bag-only node is still listed.
+    if ros_io and not bag_path.is_file():
+        _log("ros_io=on — idle (RGB from encoder ROS edge; no bag)")
+        for event in dora:
+            if event is None or event.get("type") == "STOP":
+                break
+        return
+
     if not bag_path.is_file():
         raise FileNotFoundError(
             f"dora_rgb_source: bag_path required (isolation, no ROS). got={bag_path}"

@@ -12,6 +12,7 @@ nodes:
   - id: clipseg_encoder
     path: __ENCODER_PY__
     inputs:
+      tick: dora/timer/millis/5
       rgb:
         source: rgb_source/rgb
         queue_size: __QUEUE__

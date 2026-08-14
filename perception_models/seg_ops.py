@@ -63,7 +63,9 @@ def pack_traversability_rgb(
         sel = [
             i
             for i in idxs
-            if 0 <= i < group_maps.shape[0] and group_has_prompts[i]
+            if 0 <= i < group_maps.shape[0]
+            and i < len(group_has_prompts)
+            and group_has_prompts[i]
         ]
         if not sel:
             return group_maps.new_zeros(group_maps.shape[1:])
@@ -84,13 +86,22 @@ def pack_traversability_rgb(
     pc = _c("people")
     nc = _c("non_traversable")
 
-    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in positive_groups):
+    if any(
+        0 <= i < len(group_has_prompts) and group_has_prompts[i]
+        for i in positive_groups
+    ):
         rgb[trav >= threshold] = tc
 
-    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in people_groups):
+    if any(
+        0 <= i < len(group_has_prompts) and group_has_prompts[i]
+        for i in people_groups
+    ):
         rgb[people >= threshold] = pc
 
-    if any(0 <= i < len(group_has_prompts) and group_has_prompts[i] for i in negative_groups):
+    if any(
+        0 <= i < len(group_has_prompts) and group_has_prompts[i]
+        for i in negative_groups
+    ):
         rgb[nontrav >= threshold] = nc
 
     conf = torch.maximum(torch.maximum(trav, people), nontrav)

@@ -12,6 +12,8 @@ nodes:
   - id: clipseg_encoder
     path: __ENCODER_PY__
     inputs:
+      # tick: spin ROS ApproxSync when ros_io; isolation still uses rgb below
+      tick: dora/timer/millis/5
       rgb:
         source: rgb_source/rgb
         queue_size: __QUEUE__

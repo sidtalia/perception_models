@@ -144,15 +144,23 @@ def trt_decode_film(
             f"CLIPSeg FiLM TRT batch={eng_n} but got N={n}; "
             "use a matching batched engine (no serial fallback)"
         )
-    if eng_p is not None and eng_p != p:
-        raise RuntimeError(
-            f"CLIPSeg FiLM TRT prompts={eng_p} but got P={p}; "
-            "rebuild engine for this prompt count"
+    # Allow fewer live prompts than a fixed-P engine (zero-pad, then slice).
+    if eng_p is not None and p != eng_p:
+        if p > eng_p:
+            raise RuntimeError(
+                f"CLIPSeg FiLM TRT prompts={eng_p} but got P={p}; "
+                "rebuild engine for this prompt count"
+            )
+        c = torch.cat(
+            [c, c.new_zeros((eng_p - p, c.shape[1]), dtype=c.dtype, device=c.device)],
+            dim=0,
         )
     out = engine(hs, c)
     probs = out[0] if isinstance(out, (tuple, list)) else out
     if probs.dim() == 3:
         probs = probs.unsqueeze(0)
+    if eng_p is not None and int(probs.shape[1]) == eng_p and p < eng_p:
+        probs = probs[:, :p]
     if int(probs.shape[0]) != n or int(probs.shape[1]) != p:
         raise RuntimeError(
             f"CLIPSeg FiLM TRT output {tuple(probs.shape)} != N={n} P={p}"

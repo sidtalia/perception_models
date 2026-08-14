@@ -8,6 +8,47 @@ import numpy as np
 import pyarrow as pa
 
 
+def camera_ns_from_color_topic(topic: str) -> str:
+    """``/camera_front/color/image_raw`` → ``/camera_front``."""
+    t = str(topic or "").strip()
+    if not t:
+        return ""
+    if not t.startswith("/"):
+        t = "/" + t
+    t = t.rstrip("/")
+    for suffix in (
+        "/color/image_raw",
+        "/color/image_rect_raw",
+        "/color/image_rect",
+        "/image_raw",
+    ):
+        if t.endswith(suffix):
+            return t[: -len(suffix)] or ""
+    parts = [p for p in t.split("/") if p]
+    if len(parts) >= 2:
+        return "/" + "/".join(parts[:-2]) if len(parts) > 2 else "/" + parts[0]
+    return t
+
+
+def refined_trav_topic(cam_ns: str) -> str:
+    """``/camera_front`` → ``/camera_front/segmentation/refined_traversability``."""
+    ns = str(cam_ns or "").rstrip("/")
+    if not ns:
+        return "/segmentation/refined_traversability"
+    if not ns.startswith("/"):
+        ns = "/" + ns
+    return f"{ns}/segmentation/refined_traversability"
+
+
+def refined_people_mask_topic(cam_ns: str) -> str:
+    ns = str(cam_ns or "").rstrip("/")
+    if not ns:
+        return "/segmentation/refined_people_mask"
+    if not ns.startswith("/"):
+        ns = "/" + ns
+    return f"{ns}/segmentation/refined_people_mask"
+
+
 def pack_rgb_batch(
     rgbs: Sequence[np.ndarray],
     *,
