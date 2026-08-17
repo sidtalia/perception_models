@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""CLIPSeg vision encoder: Dora ``rgb`` and/or ROS ApproximateTimeSync cams.
+"""CLIPSeg vision encoder: Dora ``rgb`` and/or ROS multi-cam RGB.
 
 Isolation: Dora ``rgb`` from ``dora_rgb_source`` (already packed) → unpack → encode.
-Live: ROS ``color_topic(s)`` ApproxSync → ``_on_rgb_ros`` → encode (no pack/unpack).
+Live: ROS ``color_topic(s)`` → queue → encode on Dora tick.
+Multi-cam default is latest-frame sync (no HW genlock). Optional ApproximateTimeSync
+via ``rgb_sync_mode=approx``. ROS spins on a background thread so BEST_EFFORT
+ingress is not dropped while TRT encode / Dora send blocks.
 
 Both paths share ``_encode_and_send`` → Dora ``features`` + forwarded ``rgb``.
 """
@@ -10,6 +13,8 @@ Both paths share ``_encode_and_send`` → Dora ``features`` + forwarded ``rgb``.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 
 import numpy as np
@@ -84,12 +89,30 @@ class ClipSegEncoderNode:
         self._bridge = None
         self._sync = None
         self._ros_subs: list = []
+        self._sync_mode = str(cfg.get("rgb_sync_mode", "latest") or "latest").lower()
+        self._latest_msgs: list = []
+        self._latest_dirty: list[bool] = []
+        self._latest_lock = threading.Lock()
+        # Latest synced batch only (drop-oldest). Encode runs on Dora thread.
+        self._pending: queue.Queue = queue.Queue(maxsize=1)
+        self._spin_running = False
+        self._spin_thread: threading.Thread | None = None
+        # Sync diagnostics: per-cam arrivals vs sync successes.
+        self._sync_diag = bool(cfg.get("rgb_sync_diag", True))
+        self._sync_diag_every_s = float(cfg.get("rgb_sync_diag_every_s", 5.0) or 5.0)
+        self._cam_rx: list[int] = []
+        self._sync_ok = 0
+        self._sync_dropped = 0  # overwritten before encode
+        self._encode_ok = 0
+        self._sync_stamp_span_ms: list[float] = []
+        self._sync_diag_t0 = time.perf_counter()
         if self.ros_io:
             self._setup_ros_subscribers()
 
         self._log(
             f"dora clipseg_encoder up: encode=trt batch_n={self.batch_n} "
-            f"ros_io={self.ros_io} topics={self.color_topics or '-'}"
+            f"ros_io={self.ros_io} sync_mode={self._sync_mode} "
+            f"topics={self.color_topics or '-'}"
         )
 
     @staticmethod
@@ -101,12 +124,12 @@ class ClipSegEncoderNode:
         print(f"[dora_clipseg_encoder] WARN {msg}", flush=True)
 
     def _setup_ros_subscribers(self) -> None:
-        """ROS cam edge: ApproximateTimeSync (or single sub) → ``_on_rgb_ros``."""
+        """ROS cam edge → pending queue (latest-frame or ApproximateTimeSync)."""
         import rclpy
         from cv_bridge import CvBridge
         from message_filters import ApproximateTimeSynchronizer, Subscriber
         from rclpy.node import Node as RosNode
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import Image
 
         if not self.color_topics:
@@ -117,39 +140,179 @@ class ClipSegEncoderNode:
         self._ros = RosNode("dora_clipseg_encoder")
         self._bridge = CvBridge()
         slop = float(self.cfg.get("rgb_sync_slop_s", 0.05) or 0.05)
+        # RELIABLE: large RGB was dropping under BEST_EFFORT (pub=10, ingress~7).
+        # Shallow depth still limits encoder backlog; drop_old handles surplus.
+        rgb_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=max(2, int(self.cfg.get("rgb_qos_depth", 2) or 2)),
+        )
 
         if len(self.color_topics) == 1:
             sub = self._ros.create_subscription(
                 Image,
                 self.color_topics[0],
                 self._on_rgb_ros_single,
-                qos_profile_sensor_data,
+                rgb_qos,
             )
             self._ros_subs.append(sub)
             self._log(f"ROS rgb sub: {self.color_topics[0]}")
             return
 
+        n = len(self.color_topics)
+        self._cam_rx = [0] * n
+
+        # Default for multi-cam without HW genlock: latest-frame (not ApproxSync).
+        # Three independent composite nodes stamp with now() → ~50–80 ms spans,
+        # so ApproximateTimeSynchronizer systematically under-fires.
+        if self._sync_mode != "approx":
+            self._latest_msgs = [None] * n
+            self._latest_dirty = [False] * n
+            for i, topic in enumerate(self.color_topics):
+                sub = self._ros.create_subscription(
+                    Image,
+                    topic,
+                    lambda msg, idx=i: self._on_latest_cam(idx, msg),
+                    rgb_qos,
+                )
+                self._ros_subs.append(sub)
+            self._log(
+                f"ROS latest-frame sync n={n} leader={self.color_topics[0]} "
+                f"qos=RELIABLE/{rgb_qos.depth} topics={self.color_topics} "
+                f"spin=bg_thread sync_diag={'on' if self._sync_diag else 'off'}"
+            )
+            return
+
         filts = [
-            Subscriber(self._ros, Image, t, qos_profile=qos_profile_sensor_data)
+            Subscriber(self._ros, Image, t, qos_profile=rgb_qos)
             for t in self.color_topics
         ]
         self._ros_subs.extend(filts)
+        if self._sync_diag:
+            for i, f in enumerate(filts):
+                f.registerCallback(lambda msg, idx=i: self._on_cam_rx(idx, msg))
+        sync_q = max(10, int(self.cfg.get("rgb_sync_queue_size", 30) or 30))
         self._sync = ApproximateTimeSynchronizer(
-            filts, queue_size=10, slop=slop
+            filts, queue_size=sync_q, slop=slop
         )
         self._sync.registerCallback(self._on_rgb_ros)
         self._log(
-            f"ROS ApproxSync slop={slop}s topics={self.color_topics}"
+            f"ROS ApproxSync slop={slop}s queue={sync_q} qos_depth={rgb_qos.depth} "
+            f"topics={self.color_topics} spin=bg_thread "
+            f"sync_diag={'on' if self._sync_diag else 'off'}"
         )
+
+    def _on_latest_cam(self, idx: int, msg) -> None:
+        """Keep newest frame per cam; emit on leader (cam0) when all have a frame.
+
+        Waiting for every cam to refresh caps rate at min(ingress). Leader-trigger
+        uses the latest side views (may be ~1 frame old) so sync tracks front.
+        """
+        if 0 <= idx < len(self._cam_rx):
+            self._cam_rx[idx] += 1
+        emit = None
+        with self._latest_lock:
+            self._latest_msgs[idx] = msg
+            self._latest_dirty[idx] = True
+            have_all = self._latest_msgs and all(
+                m is not None for m in self._latest_msgs
+            )
+            # Leader = first color_topics entry (camera_front in SSoT).
+            if have_all and idx == 0:
+                emit = tuple(self._latest_msgs)
+                self._latest_dirty = [False] * len(self._latest_dirty)
+        if emit is not None:
+            self._on_rgb_ros(*emit, color_topics=list(self.color_topics))
+        else:
+            self._maybe_log_sync_diag()
+
+    def _on_cam_rx(self, idx: int, _msg) -> None:
+        """Per-cam arrival counter (ApproxSync path)."""
+        if 0 <= idx < len(self._cam_rx):
+            self._cam_rx[idx] += 1
+        self._maybe_log_sync_diag()
+
+    def _stamp_s(self, msg) -> float:
+        return float(msg.header.stamp.sec) + 1e-9 * float(msg.header.stamp.nanosec)
+
+    def _maybe_log_sync_diag(self) -> None:
+        if not self._sync_diag:
+            return
+        now = time.perf_counter()
+        dt = now - self._sync_diag_t0
+        if dt < self._sync_diag_every_s:
+            return
+        cam_hz = [c / dt for c in self._cam_rx]
+        sync_hz = self._sync_ok / dt
+        enc_hz = self._encode_ok / dt
+        drop_hz = self._sync_dropped / dt
+        spans = self._sync_stamp_span_ms
+        span_txt = (
+            f"stamp_span_ms med={sorted(spans)[len(spans) // 2]:.1f} "
+            f"max={max(spans):.1f}"
+            if spans
+            else "stamp_span_ms=n/a"
+        )
+        bits = []
+        for i, hz in enumerate(cam_hz):
+            label = f"cam{i}"
+            if i < len(self.color_topics):
+                for p in self.color_topics[i].split("/"):
+                    if p.startswith("camera"):
+                        label = p
+                        break
+            bits.append(f"{label}={hz:.1f}Hz")
+        slop = float(self.cfg.get("rgb_sync_slop_s", 0.05) or 0.05)
+        self._log(
+            f"[sync_diag] mode={self._sync_mode} ingress={' '.join(bits)} | "
+            f"sync={sync_hz:.1f}Hz encode={enc_hz:.1f}Hz "
+            f"drop_old={drop_hz:.1f}Hz | {span_txt} | "
+            f"slop={slop:.3f}s (window={dt:.1f}s)"
+        )
+        self._cam_rx = [0] * len(self._cam_rx)
+        self._sync_ok = 0
+        self._sync_dropped = 0
+        self._encode_ok = 0
+        self._sync_stamp_span_ms = []
+        self._sync_diag_t0 = now
+
+    def _enqueue_batch(self, item: tuple) -> None:
+        """Keep only the latest synced batch (drop-oldest if encode is behind)."""
+        if self._pending.full():
+            try:
+                self._pending.get_nowait()
+                self._sync_dropped += 1
+            except queue.Empty:
+                pass
+        try:
+            self._pending.put_nowait(item)
+        except queue.Full:
+            self._sync_dropped += 1
 
     def _on_rgb_ros_single(self, msg) -> None:
         self._on_rgb_ros(msg, color_topics=[self.color_topics[0]])
 
     def _on_rgb_ros(self, *msgs, color_topics: list[str] | None = None) -> None:
-        """Synced ROS Image(s) → encode. No Dora pack/unpack on the ingress."""
-        if not msgs or self._bridge is None:
+        """Synced ROS Image(s) → enqueue raw msgs (no cv_bridge; keeps spin/GIL free)."""
+        if not msgs:
             return
+        if self._sync_diag and len(msgs) > 1:
+            stamps = [self._stamp_s(m) for m in msgs]
+            self._sync_stamp_span_ms.append((max(stamps) - min(stamps)) * 1000.0)
+            self._sync_ok += 1
+            self._maybe_log_sync_diag()
         t_src = time.perf_counter()
+        topics = color_topics if color_topics is not None else list(self.color_topics)
+        # Copy message references only — convert on the Dora/encode thread.
+        self._enqueue_batch((tuple(msgs), topics, t_src))
+
+    def _drain_pending_encode(self) -> None:
+        try:
+            msgs, topics, t_src = self._pending.get_nowait()
+        except queue.Empty:
+            return
+        if self._bridge is None:
+            return
         try:
             rgbs = [
                 np.ascontiguousarray(
@@ -163,7 +326,6 @@ class ClipSegEncoderNode:
         frame_ids = [str(m.header.frame_id or "") for m in msgs]
         stamp_sec = [int(m.header.stamp.sec) for m in msgs]
         stamp_nanosec = [int(m.header.stamp.nanosec) for m in msgs]
-        topics = color_topics if color_topics is not None else list(self.color_topics)
         self._encode_and_send(
             rgbs,
             frame_ids,
@@ -171,6 +333,17 @@ class ClipSegEncoderNode:
             stamp_nanosec,
             src_meta={"t_src_perf": t_src, "color_topics": topics},
         )
+        self._encode_ok += 1
+
+    def _ros_spin_loop(self) -> None:
+        import rclpy
+
+        while self._spin_running and self._ros is not None and rclpy.ok():
+            try:
+                rclpy.spin_once(self._ros, timeout_sec=0.005)
+            except Exception as e:  # noqa: BLE001
+                self._warn(f"ros spin: {e}")
+                time.sleep(0.01)
 
     def _encode_and_send(
         self, rgbs, frame_ids, stamp_sec, stamp_nanosec, *, src_meta=None
@@ -271,6 +444,16 @@ class ClipSegEncoderNode:
 
     def run(self) -> None:
         try:
+            if self._ros is not None:
+                self._spin_running = True
+                self._spin_thread = threading.Thread(
+                    target=self._ros_spin_loop,
+                    name="clipseg_ros_spin",
+                    daemon=True,
+                )
+                self._spin_thread.start()
+                self._log("ROS spin thread started")
+
             for event in self.dora:
                 if event is None or event.get("type") == "STOP":
                     break
@@ -278,16 +461,15 @@ class ClipSegEncoderNode:
                     continue
                 eid = event.get("id")
 
-                # ROS ApproxSync callbacks fire from spin_once (tick or any input).
-                if self._ros is not None:
-                    import rclpy
-
-                    for _ in range(16):
-                        rclpy.spin_once(self._ros, timeout_sec=0.0)
-
-                if eid == "rgb" and not self.ros_io:
+                if self.ros_io and eid == "tick":
+                    self._drain_pending_encode()
+                elif eid == "rgb" and not self.ros_io:
                     self._on_rgb(event)
         finally:
+            self._spin_running = False
+            if self._spin_thread is not None:
+                self._spin_thread.join(timeout=1.0)
+                self._spin_thread = None
             if self._ros is not None:
                 import rclpy
 

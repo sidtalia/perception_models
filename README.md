@@ -32,7 +32,17 @@ Skips mesh-ICP / FoundationStereo / spencer_port.
 Under `data/` (rebuild per Jetson — do not copy `.engine` across boxes):
 
 ```bash
+# Default: FP16 + Jetson DLA (allowGPUFallback for unsupported layers)
 bash scripts/build_all_engines.sh
+
+# GPU only:
+USE_DLA=0 bash scripts/build_all_engines.sh
 ```
+
+`USE_DLA=1` (default) passes `--useDLACore` + `--allowGPUFallback` to `trtexec`
+when TensorRT reports `num_DLA_cores > 0`. On JetPack 7.2 (L4T R39.2) TRT reports
+0 DLA cores (NVIDIA: DLA coming in a future TRT release) — builds auto-fall back
+to GPU FP16. `build_all_engines.sh` maps vision/encoder → DLA 0, FiLM/decoder → DLA 1
+when DLA is available. Dynamic-shape NanoSAM: `USE_DLA_DYNAMIC=0` if needed.
 
 Upstream NanoSAM tooling: `nanosam-src/` (`pip install -e`).

@@ -64,19 +64,16 @@ print("wrote", dst)
 EOF
 
 echo "=== 2) Build TensorRT engine (FP16, batch 1..${MAX_BATCH}, opt=${OPT_BATCH}) ==="
-TRTEXEC="$(command -v trtexec || true)"
-if [[ -z "${TRTEXEC}" && -x /usr/src/tensorrt/bin/trtexec ]]; then
-  TRTEXEC=/usr/src/tensorrt/bin/trtexec
-fi
-if [[ -z "${TRTEXEC}" ]]; then
-  echo "trtexec not found" >&2
-  exit 1
-fi
+# shellcheck source=trt_common.sh
+source "${HOUND_SCRIPTS}/trt_common.sh"
+resolve_trtexec
+configure_trt_dla_flags dynamic
 
 "${TRTEXEC}" \
   --onnx="${DST_ONNX}" \
   --saveEngine="${DST_ENGINE}" \
   --fp16 \
+  "${TRT_DLA_FLAGS[@]}" \
   --minShapes="image:1x3x${SIZE}x${SIZE}" \
   --optShapes="image:${OPT_BATCH}x3x${SIZE}x${SIZE}" \
   --maxShapes="image:${MAX_BATCH}x3x${SIZE}x${SIZE}" \

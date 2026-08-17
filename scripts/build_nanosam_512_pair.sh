@@ -72,7 +72,16 @@ print("wrote", dst)
 EOF
 
 echo "=== 2) Encoder TRT engine ==="
-trtexec --onnx="${ENC_ONNX}" --saveEngine="${ENC_ENGINE}" --fp16 --skipInference
+# shellcheck source=trt_common.sh
+source "${HOUND_SCRIPTS}/trt_common.sh"
+resolve_trtexec
+configure_trt_dla_flags static
+"${TRTEXEC}" \
+  --onnx="${ENC_ONNX}" \
+  --saveEngine="${ENC_ENGINE}" \
+  --fp16 \
+  "${TRT_DLA_FLAGS[@]}" \
+  --skipInference
 echo "wrote ${ENC_ENGINE}"
 
 echo "=== 3) Batched decoder ONNX @ ${SIZE} (embed ${EMB}) ==="

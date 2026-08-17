@@ -170,6 +170,7 @@ class SegRefineNode:
 
         self.dora_viz = bool(cfg.get("dora_viz", False))
         self.e2e_samples: list[float] = []
+        self.e2e_log = bool(cfg.get("e2e_log", True))
         self.e2e_log_every_s = max(1.0, float(cfg.get("e2e_log_every_s", 60.0)))
         self.e2e_log_t0 = 0.0
 
@@ -419,7 +420,7 @@ class SegRefineNode:
         e2e_ms = (time.perf_counter() - t0) * 1000.0
         self.e2e_samples.append(e2e_ms)
         now = time.perf_counter()
-        if now - self.e2e_log_t0 >= self.e2e_log_every_s:
+        if self.e2e_log and now - self.e2e_log_t0 >= self.e2e_log_every_s:
             st = _e2e_stats(self.e2e_samples)
             self.log(
                 f"[e2e ms] n={st['n']} median={st['median_ms']:.1f} "

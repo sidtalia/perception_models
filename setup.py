@@ -27,6 +27,7 @@ setup(
                 "scripts/export_clipseg_film_onnx.py",
                 "scripts/build_clipseg_film_engine.sh",
                 "scripts/build_all_engines.sh",
+                "scripts/trt_common.sh",
                 "scripts/bench_clipseg.py",
                 "scripts/export_nanosam_mask_decoder_batched_onnx.py",
                 "scripts/build_nanosam_mask_decoder_batched_engine.sh",

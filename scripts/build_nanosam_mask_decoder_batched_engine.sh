@@ -52,12 +52,19 @@ OPT_SHAPES="image_embeddings:${OPT_BATCH}x${EMB_C}x${EMB_H}x${EMB_W},point_coord
 MAX_SHAPES="image_embeddings:${MAX_BATCH}x${EMB_C}x${EMB_H}x${EMB_W},point_coords:${MAX_BATCH}x2x2,point_labels:${MAX_BATCH}x2,mask_input:${MAX_BATCH}x1x${MASK_IN}x${MASK_IN},has_mask_input:${MAX_BATCH}"
 
 echo "Building $ENGINE from $ONNX (min=1 opt=$OPT_BATCH max=$MAX_BATCH embed=${EMB_H}x${EMB_W} mask_in=${MASK_IN}) ..."
+HOUND_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=trt_common.sh
+source "${HOUND_SCRIPTS}/trt_common.sh"
+resolve_trtexec
+configure_trt_dla_flags dynamic
+
 # --skipInference: avoid trtexec's post-build smoke test fighting profile shapes;
 # the engine file is what we need. Re-run without it later to benchmark if desired.
-trtexec \
+"${TRTEXEC}" \
   --onnx="$ONNX" \
   --saveEngine="$ENGINE" \
   --fp16 \
+  "${TRT_DLA_FLAGS[@]}" \
   --skipInference \
   --minShapes="$MIN_SHAPES" \
   --optShapes="$OPT_SHAPES" \
