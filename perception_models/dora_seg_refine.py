@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Dora-only: ClipSeg FiLM ∥ NanoSAM encode (CUDA streams), then SAM decode.
 
-No ROS. Optional Dora viz (``dora_viz``). E2E = done − ``t_src_perf``.
+Optional ROS egress (``ros_io``): per-cam refined traversability, people mask,
+and sibling ``segmentation/camera_info`` (copied from color intrinsics, stamped
+with the refined image). Optional Dora viz (``dora_viz``). E2E = done − ``t_src_perf``.
 
 For N cams: enqueue ``decode_probs_batch`` on stream_film and
 ``encode_tensor`` on stream_sam so they overlap; then ``decode_multi``.
@@ -31,7 +33,9 @@ from perception_models.clipseg.trt import TrtFilmDecoder, load_clipseg_film_engi
 from perception_models.cuda_ipc import unpack_arrow_f16, unpack_cuda_tensor
 from perception_models.multicam_rgb_batch import (
     camera_ns_from_color_topic,
+    color_info_topic,
     refined_people_mask_topic,
+    refined_seg_info_topic,
     refined_trav_topic,
     unpack_rgb_batch,
 )
@@ -273,6 +277,9 @@ class SegRefineNode:
         self._bridge = None
         self._trav_pubs: dict[str, object] = {}
         self._people_pubs: dict[str, object] = {}
+        self._info_pubs: dict[str, object] = {}
+        self._info_subs: dict[str, object] = {}
+        self._info_cache: dict[str, object] = {}
         if self.ros_io:
             self._setup_ros_publishers()
 
@@ -327,32 +334,91 @@ class SegRefineNode:
         self._ros = RosNode("dora_seg_refine")
         self._bridge = CvBridge()
         self.log("ROS egress ready (per-cam pubs from color_topics meta)")
+        for topic in self._cfg_color_topics():
+            self._ensure_cam_io(topic)
+
+    def _cfg_color_topics(self) -> list[str]:
+        topics = [str(t) for t in (self.cfg.get("color_topics") or []) if str(t)]
+        if topics:
+            return topics
+        names = [str(n) for n in (self.cfg.get("camera_names") or []) if str(n)]
+        if names:
+            out = []
+            for name in names:
+                ns = name if str(name).startswith("/") else f"/{name}"
+                out.append(f"{ns}/color/image_raw")
+            return out
+        one = str(self.cfg.get("color_topic") or "").strip()
+        return [one] if one else []
+
+    def _spin_ros(self) -> None:
+        if self._ros is None:
+            return
+        import rclpy
+
+        rclpy.spin_once(self._ros, timeout_sec=0.0)
+
+    def _ensure_cam_io(self, color_topic: str) -> None:
+        """Trav/people pubs + color camera_info sub/republish for one cam."""
+        if self._ros is None:
+            return
+        from copy import deepcopy
+
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import CameraInfo, Image
+
+        ns = camera_ns_from_color_topic(color_topic)
+        trav_topic = refined_trav_topic(ns)
+        if trav_topic not in self._trav_pubs:
+            self._trav_pubs[trav_topic] = self._ros.create_publisher(
+                Image, trav_topic, qos_profile_sensor_data
+            )
+            self.log(f"ROS trav pub: {trav_topic}")
+        people_topic = refined_people_mask_topic(ns)
+        if people_topic not in self._people_pubs:
+            self._people_pubs[people_topic] = self._ros.create_publisher(
+                Image, people_topic, qos_profile_sensor_data
+            )
+            self.log(f"ROS people_mask pub: {people_topic}")
+        src_info = color_info_topic(ns)
+        dst_info = refined_seg_info_topic(ns)
+        if dst_info not in self._info_pubs:
+            self._info_pubs[dst_info] = self._ros.create_publisher(
+                CameraInfo, dst_info, qos_profile_sensor_data
+            )
+            self.log(f"ROS camera_info pub: {dst_info} ← {src_info}")
+
+        if src_info in self._info_subs:
+            return
+
+        def _on_info(msg: CameraInfo, *, cache_key: str = ns):
+            self._info_cache[cache_key] = deepcopy(msg)
+
+        self._info_subs[src_info] = self._ros.create_subscription(
+            CameraInfo, src_info, _on_info, qos_profile_sensor_data
+        )
 
     def _trav_pub_for(self, color_topic: str):
-        from rclpy.qos import qos_profile_sensor_data
-        from sensor_msgs.msg import Image
-
-        ns = camera_ns_from_color_topic(color_topic)
-        topic = refined_trav_topic(ns)
-        pub = self._trav_pubs.get(topic)
-        if pub is None and self._ros is not None:
-            pub = self._ros.create_publisher(Image, topic, qos_profile_sensor_data)
-            self._trav_pubs[topic] = pub
-            self.log(f"ROS trav pub: {topic}")
-        return pub
+        self._ensure_cam_io(color_topic)
+        return self._trav_pubs.get(refined_trav_topic(camera_ns_from_color_topic(color_topic)))
 
     def _people_pub_for(self, color_topic: str):
-        from rclpy.qos import qos_profile_sensor_data
-        from sensor_msgs.msg import Image
+        self._ensure_cam_io(color_topic)
+        return self._people_pubs.get(
+            refined_people_mask_topic(camera_ns_from_color_topic(color_topic))
+        )
+
+    def _publish_seg_info(self, color_topic: str, hdr) -> None:
+        from copy import deepcopy
 
         ns = camera_ns_from_color_topic(color_topic)
-        topic = refined_people_mask_topic(ns)
-        pub = self._people_pubs.get(topic)
-        if pub is None and self._ros is not None:
-            pub = self._ros.create_publisher(Image, topic, qos_profile_sensor_data)
-            self._people_pubs[topic] = pub
-            self.log(f"ROS people_mask pub: {topic}")
-        return pub
+        cached = self._info_cache.get(ns)
+        pub = self._info_pubs.get(refined_seg_info_topic(ns))
+        if cached is None or pub is None:
+            return
+        info = deepcopy(cached)
+        info.header = hdr
+        pub.publish(info)
 
     @staticmethod
     def _header_from_meta(meta: dict, index: int):
@@ -388,6 +454,7 @@ class SegRefineNode:
             )
             return
 
+        self._spin_ros()
         for i in range(n_cams):
             color_topic = topics[i]
             pub = self._trav_pub_for(color_topic)
@@ -409,9 +476,9 @@ class SegRefineNode:
                 pmsg.header = hdr
                 ppub.publish(pmsg)
 
-        import rclpy
+            self._publish_seg_info(color_topic, hdr)
 
-        rclpy.spin_once(self._ros, timeout_sec=0.0)
+        self._spin_ros()
 
     def _record_e2e(self, meta_rgb: dict) -> float | None:
         t0 = _t_src_perf(meta_rgb)

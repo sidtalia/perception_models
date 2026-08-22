@@ -49,6 +49,26 @@ def refined_people_mask_topic(cam_ns: str) -> str:
     return f"{ns}/segmentation/refined_people_mask"
 
 
+def color_info_topic(cam_ns: str) -> str:
+    """``/camera_front`` → ``/camera_front/color/camera_info``."""
+    ns = str(cam_ns or "").rstrip("/")
+    if not ns:
+        return "/camera/color/camera_info"
+    if not ns.startswith("/"):
+        ns = "/" + ns
+    return f"{ns}/color/camera_info"
+
+
+def refined_seg_info_topic(cam_ns: str) -> str:
+    """``/camera_front`` → ``/camera_front/segmentation/camera_info``."""
+    ns = str(cam_ns or "").rstrip("/")
+    if not ns:
+        return "/segmentation/camera_info"
+    if not ns.startswith("/"):
+        ns = "/" + ns
+    return f"{ns}/segmentation/camera_info"
+
+
 def pack_rgb_batch(
     rgbs: Sequence[np.ndarray],
     *,
