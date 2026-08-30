@@ -7,8 +7,13 @@
 # Inside mushr_jazzy (or Thor container with trtexec + CUDA):
 #   bash /root/colcon_ws/src/perception_models/scripts/build_all_engines.sh
 #
+# Default profile (3-cam SSoT): CLIPSeg vision+FiLM image batch 3, 9 FiLM
+# prompts; NanoSAM encoder 512 dynamic batch opt/max 3; decoder opt 16 max 32.
+#
 # Env overrides:
 #   DATA=...          output dir (default: perception_models/data)
+#   IMAGE_BATCH=3     CLIPSeg vision/FiLM N and SAM encoder TRT opt/max batch
+#   CLIPSEG_FILM_PROMPTS=9
 #   OPT_BATCH=16      NanoSAM decoder TRT opt batch
 #   MAX_BATCH=32      NanoSAM decoder TRT max batch (sam_max_boxes* <= this)
 #   USE_DLA=1         Build for Jetson DLA (+ GPU fallback). Default 1.
@@ -26,6 +31,11 @@ set -euo pipefail
 
 HOUND_SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA="${DATA:-${HOUND_SCRIPTS}/../data}"
+IMAGE_BATCH="${IMAGE_BATCH:-3}"
+CLIPSEG_FILM_BATCH="${CLIPSEG_FILM_BATCH:-${IMAGE_BATCH}}"
+CLIPSEG_FILM_PROMPTS="${CLIPSEG_FILM_PROMPTS:-9}"
+ENC_OPT_BATCH="${ENC_OPT_BATCH:-${IMAGE_BATCH}}"
+ENC_MAX_BATCH="${ENC_MAX_BATCH:-${IMAGE_BATCH}}"
 OPT_BATCH="${OPT_BATCH:-16}"
 MAX_BATCH="${MAX_BATCH:-32}"
 USE_DLA="${USE_DLA:-1}"
@@ -34,8 +44,6 @@ SKIP_CLIPSEG="${SKIP_CLIPSEG:-0}"
 SKIP_CLIPSEG_FILM="${SKIP_CLIPSEG_FILM:-0}"
 SKIP_NANOSAM="${SKIP_NANOSAM:-0}"
 SKIP_YOLO="${SKIP_YOLO:-0}"
-CLIPSEG_FILM_BATCH="${CLIPSEG_FILM_BATCH:-3}"
-CLIPSEG_FILM_PROMPTS="${CLIPSEG_FILM_PROMPTS:-9}"
 YOLO_MODEL="${YOLO_MODEL:-yolov8s-world.pt}"
 # shellcheck disable=SC2206
 YOLO_CLASSES=(${YOLO_CLASSES:-person chair door table bag})
@@ -45,17 +53,29 @@ export USE_DLA USE_DLA_DYNAMIC
 mkdir -p "${DATA}"
 DATA="$(cd "${DATA}" && pwd)"
 
+VISION_STEM="clipseg_vision_rd16_224"
+if [[ "${IMAGE_BATCH}" -gt 1 ]]; then
+  VISION_STEM="${VISION_STEM}_b${IMAGE_BATCH}"
+fi
+FILM_ENGINE="${DATA}/clipseg_film_rd16_224_b${CLIPSEG_FILM_BATCH}_p${CLIPSEG_FILM_PROMPTS}.engine"
+VISION_ENGINE="${DATA}/${VISION_STEM}.engine"
+SAM_ENC_ENGINE="${DATA}/resnet18_image_encoder_512_dyn.engine"
+SAM_DEC_ENGINE="${DATA}/mobile_sam_mask_decoder_batched_512.engine"
+
 echo "=========================================="
 echo " HOUND perception build-all"
 echo " DATA=${DATA}"
-echo " NanoSAM TRT profile: opt=${OPT_BATCH} max=${MAX_BATCH}"
+echo " CLIPSeg image batch=${IMAGE_BATCH} FiLM prompts=${CLIPSEG_FILM_PROMPTS}"
+echo " NanoSAM encoder 512 dyn opt/max=${ENC_OPT_BATCH}/${ENC_MAX_BATCH}"
+echo " NanoSAM decoder opt=${OPT_BATCH} max=${MAX_BATCH}"
 echo " USE_DLA=${USE_DLA} USE_DLA_DYNAMIC=${USE_DLA_DYNAMIC}"
 echo "=========================================="
 
 if [[ "${SKIP_CLIPSEG}" != "1" ]]; then
   echo ""
-  echo ">>> [1/4] CLIPSeg vision ONNX → TensorRT FP16 (DLA 0)"
-  DLA_CORE=0 bash "${HOUND_SCRIPTS}/build_clipseg_vision_engine.sh" "${DATA}"
+  echo ">>> [1/4] CLIPSeg vision ONNX → TensorRT FP16 (DLA 0) batch=${IMAGE_BATCH}"
+  DLA_CORE=0 bash "${HOUND_SCRIPTS}/build_clipseg_vision_engine.sh" \
+    "${DATA}" "CIDAS/clipseg-rd16" "224" "${IMAGE_BATCH}"
 else
   echo ">>> [1/4] CLIPSeg vision SKIPPED"
 fi
@@ -63,30 +83,27 @@ fi
 if [[ "${SKIP_CLIPSEG_FILM}" != "1" ]]; then
   echo ""
   echo ">>> [2/4] CLIPSeg FiLM decoder ONNX → TensorRT FP16 (DLA 1)"
+  echo "    batch=${CLIPSEG_FILM_BATCH} prompts=${CLIPSEG_FILM_PROMPTS}"
   DLA_CORE=1 bash "${HOUND_SCRIPTS}/build_clipseg_film_engine.sh" \
     "${DATA}" "CIDAS/clipseg-rd16" "224" "${CLIPSEG_FILM_BATCH}" "${CLIPSEG_FILM_PROMPTS}"
-  # Also build batch=1 for single-cam.
-  if [[ "${CLIPSEG_FILM_BATCH}" != "1" ]]; then
-    DLA_CORE=1 bash "${HOUND_SCRIPTS}/build_clipseg_film_engine.sh" \
-      "${DATA}" "CIDAS/clipseg-rd16" "224" "1" "${CLIPSEG_FILM_PROMPTS}"
-  fi
 else
   echo ">>> [2/4] CLIPSeg FiLM SKIPPED"
 fi
 
 if [[ "${SKIP_NANOSAM}" != "1" ]]; then
   echo ""
-  echo ">>> [3/4] NanoSAM 512 encoder (DLA 0) + batched mask decoder (DLA 1)"
-  # Pair script builds encoder then calls decoder script; set encoder core here,
-  # then rebuild decoder alone on DLA 1 (pair would inherit DLA 0 for both).
+  echo ">>> [3/4] NanoSAM 512 pair + dynamic encoder batch ${ENC_OPT_BATCH}..${ENC_MAX_BATCH}"
+  # Pair writes static 512 ONNX/engine + decoder; then patch encoder to dyn batch.
   DLA_CORE=0 bash "${HOUND_SCRIPTS}/build_nanosam_512_pair.sh" \
     "${DATA}" "${OPT_BATCH}" "${MAX_BATCH}"
-  DEC_ENGINE="${DATA}/mobile_sam_mask_decoder_batched_512.engine"
+  echo ">>> [3b] NanoSAM encoder dynamic batch (DLA 0)"
+  DLA_CORE=0 bash "${HOUND_SCRIPTS}/build_nanosam_image_encoder_batched.sh" \
+    "${DATA}" "512" "${ENC_OPT_BATCH}" "${ENC_MAX_BATCH}"
   DEC_ONNX="${DATA}/mobile_sam_mask_decoder_batched_512.onnx"
   if [[ -f "${DEC_ONNX}" ]]; then
-    echo ">>> [3b] Re-bind NanoSAM decoder to DLA 1"
+    echo ">>> [3c] Re-bind NanoSAM decoder to DLA 1 (opt=${OPT_BATCH} max=${MAX_BATCH})"
     DLA_CORE=1 bash "${HOUND_SCRIPTS}/build_nanosam_mask_decoder_batched_engine.sh" \
-      "${DEC_ONNX}" "${DEC_ENGINE}" "${OPT_BATCH}" "${MAX_BATCH}" 32 32 128
+      "${DEC_ONNX}" "${SAM_DEC_ENGINE}" "${OPT_BATCH}" "${MAX_BATCH}" 32 32 128
   fi
 else
   echo ">>> [3/4] NanoSAM SKIPPED"
@@ -111,16 +128,18 @@ echo " Done. Artifacts under ${DATA}:"
 ls -lh "${DATA}"/*.{engine,onnx,pt} 2>/dev/null || ls -lh "${DATA}" | tail -20
 echo ""
 echo "Point SSoT (hound_core/config/SSoT.yaml) at:"
-echo "  segmentation.clipseg_vision_engine: ${DATA}/clipseg_vision_rd16_224.engine"
-echo "  segmentation.clipseg_film_engine:   ${DATA}/clipseg_film_rd16_224_b1_p${CLIPSEG_FILM_PROMPTS}.engine"
-echo "  segmentation.sam_image_encoder:     ${DATA}/resnet18_image_encoder_512.engine"
-echo "  segmentation.sam_mask_decoder:      ${DATA}/mobile_sam_mask_decoder_batched_512.engine"
+echo "  segmentation.clipseg_vision_engine: ${VISION_ENGINE}"
+echo "  segmentation.clipseg_film_engine:   ${FILM_ENGINE}"
+echo "  segmentation.sam_image_encoder:     ${SAM_ENC_ENGINE}"
+echo "  segmentation.sam_mask_decoder:      ${SAM_DEC_ENGINE}"
+echo "  segmentation.clipseg_batch_n:       ${IMAGE_BATCH}"
+echo "  segmentation.sam_image_size:        512"
 echo "  yolo_world.model:                   ${DATA}/yolov8s-world_stashed.pt  # if exported"
 echo ""
 echo "Note: rebuild engines on this device. If TRT exposes DLA, unsupported layers"
 echo "use GPU via --allowGPUFallback. Force GPU: USE_DLA=0 bash .../build_all_engines.sh"
 echo ""
 echo "Optional benches:"
-echo "  python3 ${HOUND_SCRIPTS}/bench_clipseg.py --trt-engine ${DATA}/clipseg_vision_rd16_224.engine"
+echo "  python3 ${HOUND_SCRIPTS}/bench_clipseg.py --trt-engine ${VISION_ENGINE}"
 echo "  python3 ${HOUND_SCRIPTS}/bench_yolo_world.py --models ${DATA}/yolov8s-world_stashed.pt"
 echo "=========================================="

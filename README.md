@@ -29,7 +29,10 @@ Skips mesh-ICP / FoundationStereo / spencer_port.
 
 ## Engines
 
-Under `data/` (rebuild per Jetson — do not copy `.engine` across boxes):
+Under `data/` (rebuild per Jetson — do not copy `.engine` across boxes).
+
+One shot for 3-cam SSoT: CLIPSeg vision+FiLM **batch 3**, **9** FiLM prompts,
+NanoSAM encoder **512** dynamic batch 3, decoder opt **16** / max **32**.
 
 ```bash
 # Default: FP16 + Jetson DLA (allowGPUFallback for unsupported layers)
@@ -38,6 +41,13 @@ bash scripts/build_all_engines.sh
 # GPU only:
 USE_DLA=0 bash scripts/build_all_engines.sh
 ```
+
+Writes (then point SSoT at these):
+
+- `clipseg_vision_rd16_224_b3.engine`
+- `clipseg_film_rd16_224_b3_p9.engine`
+- `resnet18_image_encoder_512_dyn.engine`
+- `mobile_sam_mask_decoder_batched_512.engine`
 
 `USE_DLA=1` (default) passes `--useDLACore` + `--allowGPUFallback` to `trtexec`
 when TensorRT reports `num_DLA_cores > 0`. On JetPack 7.2 (L4T R39.2) TRT reports
