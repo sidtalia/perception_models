@@ -4,16 +4,20 @@
   <name>perception_models</name>
   <version>0.0.0</version>
   <description>
-    CLIPSeg + NanoSAM inference backends and ONNX/TensorRT artifacts for HOUND.
-    Dora/ROS nodes live in hound_core; this package owns model code and engines.
+    CLIPSeg + NanoSAM + YOLO-World inference backends, Dora nodes, and
+    ONNX/TensorRT artifacts for HOUND. Install pip deps via scripts/install_deps.sh.
   </description>
   <maintainer email="hound@todo.todo">hound</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-  <!-- torch, transformers, tensorrt, torch2trt, nanosam (nanosam-src) via pip -->
+  <!-- torch, transformers, tensorrt, torch2trt, nanosam, dora-rs via pip -->
 
   <export>
     <build_type>ament_python</build_type>

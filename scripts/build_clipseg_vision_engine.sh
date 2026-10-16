@@ -1,49 +1,45 @@
 #!/usr/bin/env bash
-# Build CLIPSeg vision TensorRT engine (FP16) for Orin.
+# Build CLIPSeg vision TensorRT engine (FP16, DLA by default).
+#   bash scripts/build_clipseg_vision_engine.sh [data_dir] [model] [res] [batch]
 #
-# Run inside mushr_jazzy (GPU + trtexec):
-#   bash /root/colcon_ws/src/perception_models/scripts/build_clipseg_vision_engine.sh
-#
-# Then A/B:
-#   python3 .../bench_clipseg.py --trt-engine .../clipseg_vision_rd16_224.engine
+# Env: USE_DLA=1 (default), DLA_CORE=0|1 — see trt_common.sh
 set -euo pipefail
 
 HOUND_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
-# Default: perception_models/data next to this package
+# shellcheck source=trt_common.sh
+source "${HOUND_SCRIPTS}/trt_common.sh"
+
 DATA="${1:-${HOUND_SCRIPTS}/../data}"
 MODEL="${2:-CIDAS/clipseg-rd16}"
 RES="${3:-224}"
+BATCH="${4:-1}"
 STEM="clipseg_vision_rd16_${RES}"
+if [[ "${BATCH}" -gt 1 ]]; then
+  STEM="${STEM}_b${BATCH}"
+fi
 ONNX="${DATA}/${STEM}.onnx"
 ENGINE="${DATA}/${STEM}.engine"
 
 mkdir -p "${DATA}"
 
-echo "=== 1) Export ONNX (${MODEL} @ ${RES}) ==="
+echo "=== 1) Export ONNX (${MODEL} @ ${RES} batch=${BATCH}) ==="
 python3 "${HOUND_SCRIPTS}/export_clipseg_vision_onnx.py" \
   --model "${MODEL}" \
   --input-res "${RES}" \
+  --batch "${BATCH}" \
   --output "${ONNX}"
 
 echo "=== 2) Build TensorRT engine (FP16) ==="
-# Prefer /usr/src/tensorrt/bin/trtexec on Jetson images.
-TRTEXEC="$(command -v trtexec || true)"
-if [[ -z "${TRTEXEC}" && -x /usr/src/tensorrt/bin/trtexec ]]; then
-  TRTEXEC=/usr/src/tensorrt/bin/trtexec
-fi
-if [[ -z "${TRTEXEC}" ]]; then
-  echo "trtexec not found" >&2
-  exit 1
-fi
+resolve_trtexec
+configure_trt_dla_flags static
 
 "${TRTEXEC}" \
   --onnx="${ONNX}" \
   --saveEngine="${ENGINE}" \
   --fp16 \
+  "${TRT_DLA_FLAGS[@]}" \
   --skipInference
 
 echo "=== Done ==="
 echo "ONNX:   ${ONNX}"
 echo "Engine: ${ENGINE}"
-echo "Bench:"
-echo "  python3 ${HOUND_SCRIPTS}/bench_clipseg.py --trt-engine ${ENGINE}"

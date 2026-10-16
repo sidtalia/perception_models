@@ -1,0 +1,44 @@
+# Same as segmentation_dataflow.yml + Rerun viz (dora_viz must be true in config).
+# Placeholders: __SOURCE_PY__  __ENCODER_PY__  __REFINE_PY__  __VIZ_PY__  __QUEUE__
+
+nodes:
+  - id: rgb_source
+    path: __SOURCE_PY__
+    inputs:
+      tick: dora/timer/millis/5
+    outputs:
+      - rgb
+
+  - id: clipseg_encoder
+    path: __ENCODER_PY__
+    inputs:
+      tick: dora/timer/millis/5
+      rgb:
+        source: rgb_source/rgb
+        queue_size: __QUEUE__
+    outputs:
+      - features
+      - rgb
+
+  - id: seg_refine
+    path: __REFINE_PY__
+    inputs:
+      features:
+        source: clipseg_encoder/features
+        queue_size: __QUEUE__
+      rgb:
+        source: clipseg_encoder/rgb
+        queue_size: __QUEUE__
+    outputs:
+      - overlay
+      - trav
+
+  - id: seg_viz
+    path: __VIZ_PY__
+    inputs:
+      overlay:
+        source: seg_refine/overlay
+        queue_size: 1
+      trav:
+        source: seg_refine/trav
+        queue_size: 1

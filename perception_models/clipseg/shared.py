@@ -106,10 +106,24 @@ class ClipSegParts:
         self._decode_mod: nn.Module | None = None
         self.compile_mode = compile_mode
         self._logged_map_shape = False
+        # Reused pinned NHWC staging for preprocess_rgb_batch (avoids per-frame alloc).
+        self._pin_nhwc: torch.Tensor | None = None
 
     def _info(self, msg: str):
         if self._log:
             self._log(msg)
+
+    def _ensure_pin_nhwc(self, n: int, h: int, w: int) -> torch.Tensor:
+        pin = self._pin_nhwc
+        if (
+            pin is None
+            or pin.shape[0] < n
+            or pin.shape[1] != h
+            or pin.shape[2] != w
+        ):
+            pin = torch.empty((n, h, w, 3), dtype=torch.uint8, pin_memory=True)
+            self._pin_nhwc = pin
+        return pin[:n]
 
     def build_encoder(self) -> nn.Module:
         eager = self._make_encoder_eager()
@@ -132,25 +146,47 @@ class ClipSegParts:
     @torch.inference_mode()
     def preprocess_rgb(self, rgb_uint8: np.ndarray) -> torch.Tensor:
         """HxWx3 uint8 -> normalized [1,3,res,res] float on device."""
-        t = (
-            torch.from_numpy(rgb_uint8)
-            .to(self.device)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .float()
+        return self.preprocess_rgb_batch([rgb_uint8])
+
+    @torch.inference_mode()
+    def preprocess_rgb_batch(self, rgbs: list) -> torch.Tensor:
+        """List of HxWx3 uint8 -> normalized [N,3,res,res] float on device.
+
+        One host stack into pinned NHWC → single H2D → NCHW resize/normalize.
+        """
+        if not rgbs:
+            raise ValueError("empty rgb batch")
+        n = len(rgbs)
+        h, w = int(rgbs[0].shape[0]), int(rgbs[0].shape[1])
+        pin = self._ensure_pin_nhwc(n, h, w)
+        host = pin.numpy()
+        for i, rgb in enumerate(rgbs):
+            np.copyto(host[i], np.ascontiguousarray(rgb, dtype=np.uint8))
+        pix = (
+            pin.to(device=self.device, non_blocking=True)
+            .permute(0, 3, 1, 2)
+            .to(dtype=torch.float32)
             .div_(255.0)
         )
         pix = F.interpolate(
-            t, size=(self.res, self.res), mode="bilinear", align_corners=False
+            pix, size=(self.res, self.res), mode="bilinear", align_corners=False
         )
         return (pix - self.mean) / self.std
 
     @torch.inference_mode()
     def encode(self, rgb_uint8: np.ndarray, enc: nn.Module) -> torch.Tensor:
         """-> stacked hidden states [L, S, D]."""
-        pix = self.preprocess_rgb(rgb_uint8)
+        hs = self.encode_batch([rgb_uint8], enc)
+        return hs[0]
+
+    @torch.inference_mode()
+    def encode_batch(self, rgbs: list, enc: nn.Module) -> torch.Tensor:
+        """-> stacked hidden states [N, L, S, D]."""
+        pix = self.preprocess_rgb_batch(rgbs)
         with torch.autocast("cuda", dtype=torch.float16):
             hs = enc(pix)
+        if hs.dim() == 3:
+            hs = hs.unsqueeze(0)
         return hs.float().clone()
 
     @torch.inference_mode()
@@ -159,50 +195,94 @@ class ClipSegParts:
         stacked_hs: torch.Tensor,
         dec: nn.Module,
         *,
-        height: int,
-        width: int,
+        height: int | None = None,
+        width: int | None = None,
         aggregate: str,
     ) -> torch.Tensor:
-        """Decode + aggregate + upsample -> group probs [G,H,W] at full resolution.
+        """Decode + aggregate (+ optional upsample) → group probs ``[G,H,W]``.
 
         ``stacked_hs``: [L,S,D] from the vision tower.
+        When ``height``/``width`` are omitted, returns native FiLM resolution.
         """
-        with torch.autocast("cuda", dtype=torch.float16):
-            sub = dec(stacked_hs, self.cond).float()  # [P,res,res]
-        if not self._logged_map_shape:
-            eff = self.res // 16
-            self._info(
-                f"CLIPSeg FiLM map {tuple(sub.shape)} (~{eff}x{eff} token grid)"
+        out = self.decode_probs_batch(
+            stacked_hs.unsqueeze(0) if stacked_hs.dim() == 3 else stacked_hs,
+            dec,
+            height=height,
+            width=width,
+            aggregate=aggregate,
+        )
+        return out[0]
+
+    @torch.inference_mode()
+    def decode_probs_batch(
+        self,
+        stacked_hs: torch.Tensor,
+        dec: nn.Module,
+        *,
+        aggregate: str,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> torch.Tensor:
+        """Batched FiLM across images → group probs ``[N,G,H,W]`` (fp16).
+
+        ``stacked_hs``: ``[N,L,S,D]`` (or ``[L,S,D]``, treated as N=1).
+        One decoder enqueue of size ``N * n_prompts`` instead of N serial decodes.
+        Stays in fp16 through aggregate / optional upsample; cast at host boundary.
+        Omit ``height``/``width`` to keep native FiLM map size (for boxes/CC).
+        """
+        if stacked_hs.dim() == 3:
+            stacked_hs = stacked_hs.unsqueeze(0)
+        if stacked_hs.dim() != 4:
+            raise ValueError(
+                f"stacked_hs expected [N,L,S,D] or [L,S,D], got {tuple(stacked_hs.shape)}"
             )
-            self._logged_map_shape = True
-        groups = self.aggregate_groups(sub, aggregate)
-        if self.prompts.suppress_idx:
-            sky = sub[self.prompts.suppress_idx].amax(dim=0)
-            groups = (groups - sky.unsqueeze(0)).clamp_(0.0, 1.0)
-        probs = F.interpolate(
-            groups.unsqueeze(0),
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )[0].clamp_(0.0, 1.0)
-        return probs
+
+        with torch.autocast("cuda", dtype=torch.float16):
+            sub = dec(stacked_hs, self.cond)  # [N,P,res,res]
+            if sub.dtype != torch.float16:
+                sub = sub.to(dtype=torch.float16)
+            if not self._logged_map_shape:
+                self._info(f"CLIPSeg FiLM map {tuple(sub.shape)} dtype={sub.dtype}")
+                self._logged_map_shape = True
+
+            groups = self.aggregate_groups_batch(sub, aggregate)  # [N,G,h,w]
+            if self.prompts.suppress_idx:
+                sky = sub[:, self.prompts.suppress_idx].amax(dim=1)  # [N,h,w]
+                groups = (groups - sky.unsqueeze(1)).clamp_(0.0, 1.0)
+            if height is None or width is None:
+                return groups.clamp_(0.0, 1.0)
+            return F.interpolate(
+                groups,
+                size=(int(height), int(width)),
+                mode="bilinear",
+                align_corners=False,
+            ).clamp_(0.0, 1.0)
 
     def aggregate_groups(self, sub: torch.Tensor, aggregate: str) -> torch.Tensor:
         """Per-sub-prompt maps [P,H,W] -> per-group maps [n_groups,H,W]."""
-        out = sub.new_zeros((self.prompts.n_groups, sub.shape[1], sub.shape[2]))
+        return self.aggregate_groups_batch(sub.unsqueeze(0), aggregate)[0]
+
+    def aggregate_groups_batch(
+        self, sub: torch.Tensor, aggregate: str
+    ) -> torch.Tensor:
+        """Batched [N,P,H,W] -> [N,n_groups,H,W]."""
+        if sub.dim() != 4:
+            raise ValueError(f"expected [N,P,H,W], got {tuple(sub.shape)}")
+        n, _p, hh, ww = sub.shape
+        out = sub.new_zeros((n, self.prompts.n_groups, hh, ww))
         agg = (aggregate or "max").lower()
         for gi, idx in enumerate(self.prompts.group_index):
             if not idx:
                 continue
-            s = sub[idx]
+            s = sub[:, idx]  # [N,k,H,W]
             if agg == "mean":
-                out[gi] = s.mean(dim=0)
+                out[:, gi] = s.mean(dim=1)
             elif agg == "sum":
-                out[gi] = s.sum(dim=0).clamp_(0.0, 1.0)
+                out[:, gi] = s.sum(dim=1).clamp_(0.0, 1.0)
             elif agg == "noisy_or":
-                out[gi] = 1.0 - (1.0 - s).prod(dim=0)
+                out[:, gi] = 1.0 - (1.0 - s).prod(dim=1)
             else:
-                out[gi] = s.amax(dim=0)
+                out[:, gi] = s.amax(dim=1)
         return out
 
     def _make_encoder_eager(self) -> nn.Module:
@@ -215,17 +295,18 @@ class ClipSegParts:
                 self.extract = list(outer.extract)
 
             def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-                # pixel_values: [1,3,res,res] -> [L,S,D]
+                # pixel_values: [N,3,res,res] -> [N,L,S,D] (N=1 squeezable by caller)
                 vo = self.model.clip.vision_model(
                     pixel_values=pixel_values,
                     output_hidden_states=True,
                     return_dict=True,
                 )
                 layers = [
-                    vo.hidden_states[i + 1].contiguous()  # [1,S,D]
+                    vo.hidden_states[i + 1].contiguous()  # [N,S,D]
                     for i in self.extract
                 ]
-                return torch.stack(layers, dim=1)[0]  # [L,S,D]
+                # stack on layer dim → [N,L,S,D]
+                return torch.stack(layers, dim=1)
 
         return _Enc().eval()
 
@@ -238,13 +319,37 @@ class ClipSegParts:
                 self.model = outer.model
 
             def forward(self, stacked_hs: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-                # stacked_hs: [L,S,D]; batch = n_prompts.
-                n = cond.shape[0]
+                """FiLM decode.
+
+                * ``stacked_hs`` ``[L,S,D]`` → logits ``[P,H,W]`` (prompt-batched)
+                * ``stacked_hs`` ``[N,L,S,D]`` → logits ``[N,P,H,W]`` (image×prompt)
+                """
+                p = int(cond.shape[0])
+                if stacked_hs.dim() == 3:
+                    hs = tuple(
+                        stacked_hs[i].unsqueeze(0).expand(p, -1, -1).contiguous()
+                        for i in range(stacked_hs.shape[0])
+                    )
+                    return self.model.decoder(hs, cond).logits.sigmoid()
+
+                if stacked_hs.dim() != 4:
+                    raise ValueError(
+                        f"decoder expected [L,S,D] or [N,L,S,D], got {tuple(stacked_hs.shape)}"
+                    )
+                n, l, s, d = stacked_hs.shape
                 hs = tuple(
-                    stacked_hs[i].unsqueeze(0).expand(n, -1, -1).contiguous()
-                    for i in range(stacked_hs.shape[0])
+                    stacked_hs[:, i]
+                    .unsqueeze(1)
+                    .expand(-1, p, -1, -1)
+                    .reshape(n * p, s, d)
+                    .contiguous()
+                    for i in range(l)
                 )
-                return self.model.decoder(hs, cond).logits.sigmoid()
+                cond_b = (
+                    cond.unsqueeze(0).expand(n, -1, -1).reshape(n * p, -1).contiguous()
+                )
+                out = self.model.decoder(hs, cond_b).logits.sigmoid()  # [N*P,H,W]
+                return out.view(n, p, out.shape[-2], out.shape[-1])
 
         return _Dec().eval()
 
@@ -254,7 +359,10 @@ class ClipSegParts:
         def run(mod: nn.Module):
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 for _ in range(3):
-                    _ = mod(dummy)
+                    out = mod(dummy)
+                    if out.dim() == 4 and out.shape[0] == 1:
+                        out = out[0]
+                    _ = out
             torch.cuda.synchronize()
 
         try:
@@ -267,16 +375,23 @@ class ClipSegParts:
         self._info("CLIPSeg encoder warmup/compile complete.")
         return enc
 
-    def warmup_decoder(self, dec: nn.Module) -> nn.Module:
+    def warmup_decoder(
+        self, dec: nn.Module, *, batch_n: int = 1
+    ) -> nn.Module:
         enc = self._encode_mod if self._encode_mod is not None else self._make_encoder_eager()
-        dummy = torch.zeros(1, 3, self.res, self.res, device=self.device)
+        bn = max(1, int(batch_n))
+        dummy = torch.zeros(bn, 3, self.res, self.res, device=self.device)
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
             hs = enc(dummy).float()
+            if hs.dim() == 3:
+                hs = hs.unsqueeze(0)
 
         def run(mod: nn.Module):
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 for _ in range(3):
-                    _ = mod(hs, self.cond)
+                    # Warm both contracts (compile caches shapes).
+                    _ = mod(hs[0], self.cond)
+                    _ = mod(hs if bn > 1 else hs[:1], self.cond)
             torch.cuda.synchronize()
 
         try:
@@ -286,5 +401,7 @@ class ClipSegParts:
             dec = self._make_decoder_eager()
             self._decode_mod = dec
             run(dec)
-        self._info("CLIPSeg decoder warmup/compile complete.")
+        self._info(
+            f"CLIPSeg decoder warmup/compile complete (batch_n={bn})."
+        )
         return dec

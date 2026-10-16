@@ -1,53 +1,58 @@
 # perception_models
 
-CLIPSeg + NanoSAM **inference backends** and ONNX/TensorRT artifacts for HOUND.
-YOLO-World backends (prompt stash + detect; TRT TBD) live under ``yolo_world/``.
-
-Dora/ROS nodes stay in `hound_core`; this package owns model code, rebuild
-scripts, and engines.
+CLIPSeg + NanoSAM + YOLO-World **backends**, Dora nodes, and ONNX/TensorRT artifacts for HOUND.
 
 ## Layout
 
 ```
 perception_models/
   perception_models/
-    clipseg/           # torch encode/FiLM + optional TRT vision
-    yolo_world/        # stash class embeds + detect (TRT stub)
-    nanosam_trt/       # NanoSamEncoder / NanoSamDecoder (uses pip nanosam)
-    seg_ops.py         # probs→labels, boxes, overlay helpers
-  scripts/             # export / trtexec / bench
-  data/                # *.onnx / *.engine (built on this Orin)
+    clipseg/ nanosam_trt/ yolo_world/   # inference backends
+    dora_*.py cuda_ipc.py utils.py      # Dora ROS nodes
+    seg_ops.py sam_box_merge.py
+  dora/                                 # dataflows + design notes
+  scripts/                              # export / trtexec / install_deps / dora wrappers
+  data/                                 # *.onnx / *.engine (built on device)
+  legacy/                               # old ROS clipseg/sam nodes (not launched)
 ```
 
-Design: `hound_core/dora/SEGMENTATION.md` (CLIPSeg), `hound_core/dora/YOLO_WORLD.md`.
+Mission bring-up still lives in `hound_core` (SSoT + launch); it starts these
+Dora graphs via `dora run`.
 
-## Engines (default paths)
-
-Under `data/`:
-
-- `clipseg_vision_rd16_224.{onnx,engine}`
-- `resnet18_image_encoder_512.{onnx,engine}`
-- `mobile_sam_mask_decoder_batched_512.{onnx,engine}`
-- (also unsuffixed / 1024 variants for A/B)
-
-SSoT in `hound_core` points at these absolute paths. Rebuild rather than
-copying engines across boxes with different TensorRT versions.
-
-## Rebuild
-
-On each Jetson (Orin NX / Thor), rebuild engines — do not copy `.engine` files
-across boxes:
+## Install deps
 
 ```bash
-# All of: CLIPSeg TRT + NanoSAM 512 pair + YOLO-World stashed .pt
-bash /root/colcon_ws/src/perception_models/scripts/build_all_engines.sh
-
-# Or piece-wise:
-bash /root/colcon_ws/src/perception_models/scripts/build_clipseg_vision_engine.sh
-bash /root/colcon_ws/src/perception_models/scripts/build_nanosam_512_pair.sh \
-  /root/colcon_ws/src/perception_models/data 16 32
-python3 /root/colcon_ws/src/perception_models/scripts/export_yolo_world.py --format pt
+bash /root/colcon_ws/src/perception_models/scripts/install_deps.sh
 ```
 
-Upstream MobileSAM / NanoSAM tooling lives in `nanosam-src/` (`pip install -e`).
-Design notes: `hound_core/dora/SEGMENTATION.md`.
+Skips mesh-ICP / FoundationStereo / spencer_port.
+
+## Engines
+
+Under `data/` (rebuild per Jetson — do not copy `.engine` across boxes).
+
+One shot for 3-cam SSoT: CLIPSeg vision+FiLM **batch 3**, **9** FiLM prompts,
+NanoSAM encoder **512** dynamic batch 3, decoder opt **16** / max **32**.
+
+```bash
+# Default: FP16 + Jetson DLA (allowGPUFallback for unsupported layers)
+bash scripts/build_all_engines.sh
+
+# GPU only:
+USE_DLA=0 bash scripts/build_all_engines.sh
+```
+
+Writes (then point SSoT at these):
+
+- `clipseg_vision_rd16_224_b3.engine`
+- `clipseg_film_rd16_224_b3_p9.engine`
+- `resnet18_image_encoder_512_dyn.engine`
+- `mobile_sam_mask_decoder_batched_512.engine`
+
+`USE_DLA=1` (default) passes `--useDLACore` + `--allowGPUFallback` to `trtexec`
+when TensorRT reports `num_DLA_cores > 0`. On JetPack 7.2 (L4T R39.2) TRT reports
+0 DLA cores (NVIDIA: DLA coming in a future TRT release) — builds auto-fall back
+to GPU FP16. `build_all_engines.sh` maps vision/encoder → DLA 0, FiLM/decoder → DLA 1
+when DLA is available. Dynamic-shape NanoSAM: `USE_DLA_DYNAMIC=0` if needed.
+
+Upstream NanoSAM tooling: `nanosam-src/` (`pip install -e`).

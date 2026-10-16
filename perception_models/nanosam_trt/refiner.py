@@ -1,4 +1,4 @@
-"""NanoSAM TensorRT helpers.
+"""NanoSAM TensorRT helpers (batched engines only).
 
   * ``NanoSamEncoder`` — ResNet18 image encoder engine
   * ``NanoSamDecoder`` — batched MobileSAM mask decoder engine
@@ -8,11 +8,17 @@
 
 from __future__ import annotations
 
+import os
 import time
 
+import cv2
 import numpy as np
-import PIL.Image
 import torch
+import torch.nn.functional as F
+
+
+def _profile() -> bool:
+    return os.environ.get("PROFILE", "0") == "1"
 
 
 def _load_image_encoder(path: str):
@@ -28,7 +34,7 @@ def _load_mask_decoder(path: str):
 
 
 class NanoSamEncoder:
-    """TensorRT image encoder only. Returns features [1,C,H,W] on CUDA."""
+    """TensorRT image encoder. Requires dynamic or fixed batch matching N."""
 
     def __init__(
         self,
@@ -41,46 +47,97 @@ class NanoSamEncoder:
         self.image_encoder_size = int(image_encoder_size)
         self.feature_size = self.image_encoder_size // 16
         self.log = logger
+        self.engine_path = str(image_encoder)
         if self.log:
             self.log.info(
                 f"NanoSAM encoder engine={image_encoder} "
                 f"size={self.image_encoder_size} feature={self.feature_size}"
             )
         self.engine = _load_image_encoder(image_encoder)
+        self.engine_batch = self._read_engine_batch()
         self.last_timing = {"encoder_ms": 0.0}
+        self._image_mean = torch.tensor(
+            [123.675, 116.28, 103.53], dtype=torch.float32
+        ).view(3, 1, 1)
+        self._image_std = torch.tensor(
+            [58.395, 57.12, 57.375], dtype=torch.float32
+        ).view(3, 1, 1)
+        # Reused pinned NCHW canvas for preprocess_batch → non_blocking H2D.
+        self._pin_nchw: torch.Tensor | None = None
         self.warmup()
+
+    def _read_engine_batch(self) -> int | None:
+        """Fixed input batch, or None if dynamic / unknown."""
+        eng = getattr(self.engine, "engine", None)
+        if eng is None:
+            return None
+        try:
+            shape = tuple(eng.get_tensor_shape("image"))
+        except Exception:
+            return None
+        if not shape:
+            return None
+        b = int(shape[0])
+        return b if b > 0 else None
+
+    def _info(self, msg: str):
+        if self.log:
+            self.log.info(msg)
 
     def warmup(self):
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        _ = self.encode(dummy)
-        if self.log:
-            self.log.info("NanoSAM encoder warmup complete")
+        _ = self.encode_batch([dummy])
+        if self.engine_batch is None or self.engine_batch >= 3:
+            _ = self.encode_batch([dummy, dummy, dummy])
+            self._info("NanoSAM encoder warmup complete (N=1 + N=3)")
+        else:
+            self._info(
+                f"NanoSAM encoder warmup complete (engine_batch={self.engine_batch})"
+            )
 
     def preprocess(self, rgb_uint8: np.ndarray) -> torch.Tensor:
         """CPU resize/normalize; returns float32 CPU tensor [1,3,S,S]."""
+        return self.preprocess_batch([rgb_uint8])
+
+    def _ensure_pin_nchw(self, n: int, size: int) -> torch.Tensor:
+        pin = self._pin_nchw
+        if pin is None or pin.shape[0] < n or pin.shape[2] != size:
+            # Allocate outside inference_mode so warmup (encode_batch) does not
+            # leave a pinned buffer that rejects inplace ops on the hot path.
+            with torch.inference_mode(False):
+                pin = torch.empty(
+                    (n, 3, size, size), dtype=torch.float32, pin_memory=True
+                )
+            self._pin_nchw = pin
+        return pin[:n]
+
+    def preprocess_batch(self, rgbs: list) -> torch.Tensor:
+        """List of HxWx3 uint8 RGB → pinned float32 ``[N,3,S,S]`` (letterboxed)."""
+        if not rgbs:
+            raise ValueError("empty rgb batch")
         size = self.image_encoder_size
-        image = PIL.Image.fromarray(rgb_uint8)
-        image_mean = torch.tensor([123.675, 116.28, 103.53])[:, None, None]
-        image_std = torch.tensor([58.395, 57.12, 57.375])[:, None, None]
-        aspect_ratio = image.width / image.height
-        if aspect_ratio >= 1:
-            resize_width = size
-            resize_height = int(size / aspect_ratio)
-        else:
-            resize_height = size
-            resize_width = int(size * aspect_ratio)
-        image_np = np.asarray(image.resize((resize_width, resize_height)))
-        image_torch = torch.from_numpy(image_np).permute(2, 0, 1)
-        image_torch = (image_torch.float() - image_mean) / image_std
-        out = torch.zeros((1, 3, size, size), dtype=torch.float32)
-        out[0, :, :resize_height, :resize_width] = image_torch
+        n = len(rgbs)
+        out = self._ensure_pin_nchw(n, size)
+        out.zero_()
+        mean = self._image_mean
+        std = self._image_std
+        for i, rgb in enumerate(rgbs):
+            h, w = int(rgb.shape[0]), int(rgb.shape[1])
+            if w >= h:
+                rw, rh = size, max(1, int(size * h / w))
+            else:
+                rh, rw = size, max(1, int(size * w / h))
+            resized = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
+            x = torch.from_numpy(resized).permute(2, 0, 1).to(dtype=torch.float32)
+            x.sub_(mean).div_(std)
+            out[i, :, :rh, :rw].copy_(x)
         return out
 
     @torch.inference_mode()
     def encode_tensor(
         self, image_tensor: torch.Tensor, *, synchronize: bool = True
     ) -> torch.Tensor:
-        """Run TRT image encoder. Caller may wrap in ``torch.cuda.stream``."""
+        """Run TRT image encoder. ``image_tensor``: ``[N,3,S,S]`` (batched)."""
         if synchronize:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -88,7 +145,16 @@ class NanoSamEncoder:
             image_tensor = image_tensor.to(
                 device=self.dev, dtype=torch.float32, non_blocking=True
             )
+        n = int(image_tensor.shape[0])
+        eng_b = self.engine_batch
+        if eng_b is not None and eng_b != n:
+            raise RuntimeError(
+                f"NanoSAM encoder engine batch={eng_b} but got N={n}; "
+                "use a dynamic/_bN engine (no serial fallback)"
+            )
         features = self.engine(image_tensor)
+        if isinstance(features, (tuple, list)):
+            features = features[0]
         if synchronize:
             torch.cuda.synchronize()
             self.last_timing = {"encoder_ms": (time.perf_counter() - t0) * 1000.0}
@@ -98,9 +164,16 @@ class NanoSamEncoder:
     def encode(self, rgb_uint8: np.ndarray, *, synchronize: bool = True) -> torch.Tensor:
         return self.encode_tensor(self.preprocess(rgb_uint8), synchronize=synchronize)
 
+    @torch.inference_mode()
+    def encode_batch(
+        self, rgbs: list, *, synchronize: bool = True
+    ) -> torch.Tensor:
+        """Encode N RGBs → features ``[N,C,Hf,Wf]`` (one TRT enqueue)."""
+        return self.encode_tensor(self.preprocess_batch(rgbs), synchronize=synchronize)
+
 
 class NanoSamDecoder:
-    """TensorRT mask decoder only. Prefers one batched enqueue for all boxes."""
+    """TensorRT mask decoder — batched prompts, reusable CUDA buffers."""
 
     def __init__(
         self,
@@ -108,25 +181,39 @@ class NanoSamDecoder:
         orig_image_encoder_size: int = 1024,
         device: str = "cuda",
         logger=None,
+        max_batch_k: int = 16,
     ):
         self.dev = device
         self.orig_image_encoder_size = int(orig_image_encoder_size)
         self.feature_size = self.orig_image_encoder_size // 16
         self.mask_input_size = 4 * self.feature_size
+        self.max_batch_k = max(1, int(max_batch_k))
         self.log = logger
-        self._batch_ok = False
         if self.log:
             self.log.info(
                 f"NanoSAM decoder engine={mask_decoder} "
                 f"canvas={self.orig_image_encoder_size} "
-                f"feature={self.feature_size} mask_in={self.mask_input_size}"
+                f"feature={self.feature_size} mask_in={self.mask_input_size} "
+                f"max_batch_k={self.max_batch_k}"
             )
         self.engine = _load_mask_decoder(mask_decoder)
+        ms = self.mask_input_size
+        k = self.max_batch_k
+        self._point_coords = torch.zeros(k, 2, 2, device=self.dev, dtype=torch.float32)
+        self._point_labels = torch.zeros(k, 2, device=self.dev, dtype=torch.float32)
+        self._point_labels[:, 0] = 2.0
+        self._point_labels[:, 1] = 3.0
+        self._mask_input = torch.zeros(k, 1, ms, ms, device=self.dev, dtype=torch.float32)
+        self._has_mask_input = torch.zeros(k, device=self.dev, dtype=torch.float32)
+        self._pts_host = np.zeros((k, 2, 2), dtype=np.float32)
         self.last_timing = {
             "decoder_ms": 0.0,
+            "trt_ms": 0.0,
+            "upscale_ms": 0.0,
             "n_boxes": 0,
+            "n_upscales": 0,
             "decoder_ms_per_box": 0.0,
-            "decoder_mode": "serial",
+            "decoder_mode": "batched",
         }
         self.warmup()
 
@@ -138,6 +225,25 @@ class NanoSamDecoder:
         if self.log:
             self.log.info(msg)
 
+    def _ensure_k(self, k: int) -> None:
+        if k <= self.max_batch_k:
+            return
+        # Grow buffers if a frame exceeds the warm capacity (rare).
+        self.max_batch_k = int(k)
+        ms = self.mask_input_size
+        self._point_coords = torch.zeros(
+            k, 2, 2, device=self.dev, dtype=torch.float32
+        )
+        self._point_labels = torch.zeros(k, 2, device=self.dev, dtype=torch.float32)
+        self._point_labels[:, 0] = 2.0
+        self._point_labels[:, 1] = 3.0
+        self._mask_input = torch.zeros(
+            k, 1, ms, ms, device=self.dev, dtype=torch.float32
+        )
+        self._has_mask_input = torch.zeros(k, device=self.dev, dtype=torch.float32)
+        self._pts_host = np.zeros((k, 2, 2), dtype=np.float32)
+        self._info(f"NanoSAM decoder buffers grew to max_batch_k={k}")
+
     def warmup(self):
         fs = self.feature_size
         feat = torch.zeros(1, 256, fs, fs, device=self.dev, dtype=torch.float32)
@@ -146,90 +252,103 @@ class NanoSamDecoder:
             np.array([220, 120, 400, 360], dtype=np.float32),
         ]
         try:
-            try:
-                _ = self._predict_boxes_batched(feat, boxes, (480, 640))
-                self._batch_ok = True
-                self._info("NanoSAM mask decoder: batched prompts OK")
-            except Exception as e:  # noqa: BLE001
-                self._batch_ok = False
-                self._warn(
-                    f"NanoSAM mask decoder batch unsupported ({e}); "
-                    "using serial decode. Rebuild with "
-                    "perception_models/scripts/export_nanosam_mask_decoder_batched_onnx.py + "
-                    "perception_models/scripts/build_nanosam_mask_decoder_batched_engine.sh"
-                )
-                _ = self._predict_box(feat, boxes[0], (480, 640))
-            self._info(
-                f"NanoSAM decoder warmup complete (mode="
-                f"{'batched' if self._batch_ok else 'serial'})."
-            )
+            _ = self._predict_boxes_batched(feat, boxes, (480, 640))
         except Exception as e:  # noqa: BLE001
-            self._warn(f"NanoSAM decoder warmup failed: {e}")
-            raise
+            raise RuntimeError(
+                f"NanoSAM mask decoder batch unsupported ({e}). Rebuild with "
+                "perception_models/scripts/export_nanosam_mask_decoder_batched_onnx.py + "
+                "perception_models/scripts/build_nanosam_mask_decoder_batched_engine.sh"
+            ) from e
+        self._info("NanoSAM decoder warmup complete (mode=batched).")
 
-    def _scale_points(self, points_xy: np.ndarray, image_hw) -> np.ndarray:
-        from nanosam.utils.predictor import preprocess_points
+    def _scale_points_inplace(self, pts_host: np.ndarray, image_hw, k: int) -> None:
+        """Scale first k box-corners in ``pts_host`` into encoder canvas coords."""
+        h, w = int(image_hw[0]), int(image_hw[1])
+        scale = self.orig_image_encoder_size / float(max(h, w))
+        pts_host[:k] *= scale
 
-        return preprocess_points(
-            points_xy, image_hw, self.orig_image_encoder_size
+    def _upscale_low_res(self, low_res: torch.Tensor, image_hw) -> torch.Tensor:
+        """Letterbox crop of low-res logits → full ``image_hw`` (batched)."""
+        size = self.mask_input_size
+        ih, iw = int(image_hw[0]), int(image_hw[1])
+        if iw > ih:
+            lim_x = size
+            lim_y = max(1, int(size * ih / iw))
+        else:
+            lim_y = size
+            lim_x = max(1, int(size * iw / ih))
+        return F.interpolate(
+            low_res[:, :, :lim_y, :lim_x],
+            size=(ih, iw),
+            mode="bilinear",
+            align_corners=False,
         )
-
-    def _predict_box(
-        self, features: torch.Tensor, box_xyxy: np.ndarray, image_hw
-    ) -> torch.Tensor:
-        from nanosam.utils.predictor import upscale_mask
-
-        x0, y0, x1, y1 = [float(v) for v in box_xyxy]
-        point_coords = np.array([[x0, y0], [x1, y1]], dtype=np.float32)
-        point_labels = np.array([2, 3], dtype=np.float32)
-        point_coords = self._scale_points(point_coords, image_hw)
-        ms = self.mask_input_size
-        pts = torch.from_numpy(point_coords).unsqueeze(0).to(
-            device=self.dev, dtype=torch.float32
-        )
-        lbl = torch.from_numpy(point_labels).unsqueeze(0).to(
-            device=self.dev, dtype=torch.float32
-        )
-        mask_input = torch.zeros(1, 1, ms, ms, device=self.dev, dtype=torch.float32)
-        has_mask_input = torch.zeros(1, device=self.dev, dtype=torch.float32)
-        _iou, low_res = self.engine(
-            features, pts, lbl, mask_input, has_mask_input
-        )
-        hi = upscale_mask(low_res, image_hw, size=self.mask_input_size)
-        return (hi[0, 0] > 0).float()
 
     def _predict_boxes_batched(
         self, features: torch.Tensor, boxes_xyxy, image_hw
     ) -> torch.Tensor:
-        from nanosam.utils.predictor import upscale_mask
-
+        """``features`` ``[1,C,H,W]`` → expand to one row per box, then decode."""
         k = len(boxes_xyxy)
-        pts = np.zeros((k, 2, 2), dtype=np.float32)
+        if k == 0:
+            h, w = int(image_hw[0]), int(image_hw[1])
+            return torch.zeros((0, h, w), device=self.dev, dtype=torch.float32)
+        if features.dim() == 3:
+            features = features.unsqueeze(0)
+        features_b = features.expand(k, -1, -1, -1).contiguous()
+        low_res, _ = self._run_decoder(features_b, boxes_xyxy, image_hw)
+        hi = self._upscale_low_res(low_res, image_hw)
+        return (hi[:, 0] > 0).float()
+
+    def _run_decoder(
+        self, features_b: torch.Tensor, boxes_xyxy, image_hw
+    ) -> tuple[torch.Tensor, dict]:
+        """TRT decode → low-res logits ``[K,1,ms,ms]``. Reuses CUDA buffers."""
+        k = len(boxes_xyxy)
+        if k == 0:
+            ms = self.mask_input_size
+            empty = torch.zeros(0, 1, ms, ms, device=self.dev, dtype=torch.float32)
+            return empty, {"trt_ms": 0.0}
+        if int(features_b.shape[0]) != k:
+            raise ValueError(
+                f"features_b batch {features_b.shape[0]} != n_boxes {k}"
+            )
+        self._ensure_k(k)
+
+        pts = self._pts_host
         for i, box in enumerate(boxes_xyxy):
             x0, y0, x1, y1 = [float(v) for v in box]
-            pts[i, 0] = (x0, y0)
-            pts[i, 1] = (x1, y1)
-        pts = self._scale_points(pts, image_hw)
-        labels = np.tile(np.array([2.0, 3.0], dtype=np.float32), (k, 1))
+            pts[i, 0, 0] = x0
+            pts[i, 0, 1] = y0
+            pts[i, 1, 0] = x1
+            pts[i, 1, 1] = y1
+        self._scale_points_inplace(pts, image_hw, k)
 
-        features_b = features.expand(k, -1, -1, -1).contiguous()
-        point_coords = torch.from_numpy(pts).to(device=self.dev, dtype=torch.float32)
-        point_labels = torch.from_numpy(labels).to(device=self.dev, dtype=torch.float32)
-        ms = self.mask_input_size
-        mask_input = torch.zeros(k, 1, ms, ms, device=self.dev, dtype=torch.float32)
-        has_mask_input = torch.zeros(k, device=self.dev, dtype=torch.float32)
+        self._point_coords[:k].copy_(
+            torch.from_numpy(pts[:k]), non_blocking=True
+        )
+        # Labels stay 2/3; mask_input / has_mask stay zero (no dense mask prompt).
+
+        profile = _profile()
+        if profile:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
         _iou, low_res = self.engine(
-            features_b,
-            point_coords,
-            point_labels,
-            mask_input,
-            has_mask_input,
+            features_b.contiguous(),
+            self._point_coords[:k],
+            self._point_labels[:k],
+            self._mask_input[:k],
+            self._has_mask_input[:k],
         )
         if low_res.shape[1] > 1:
             low_res = low_res[:, :1]
-        hi = upscale_mask(low_res, image_hw, size=self.mask_input_size)
-        return (hi[:, 0] > 0).float()
+
+        if profile:
+            torch.cuda.synchronize()
+            trt_ms = (time.perf_counter() - t0) * 1000.0
+        else:
+            trt_ms = 0.0
+        return low_res, {"trt_ms": trt_ms}
 
     @torch.inference_mode()
     def decode(
@@ -241,60 +360,129 @@ class NanoSamDecoder:
         image_hw,
     ) -> torch.Tensor:
         """features: [1,C,H,W]. Returns [n_classes,H,W] float 0/1 on CUDA."""
-        h, w = int(image_hw[0]), int(image_hw[1])
-        refined = torch.zeros((n_classes, h, w), device=self.dev, dtype=torch.float32)
+        outs = self.decode_multi(
+            features if features.dim() == 4 else features.unsqueeze(0),
+            [(classes, boxes_xyxy, n_classes, image_hw)],
+        )
+        return outs[0]
+
+    @torch.inference_mode()
+    def decode_multi(
+        self,
+        features: torch.Tensor,
+        requests: list,
+    ) -> list:
+        """Batched mask decode across images (and their boxes).
+
+        ``features``: ``[N,C,Hf,Wf]``
+        ``requests``: list length N of
+          ``(classes, boxes_xyxy, n_classes, image_hw)``
+        Returns list of ``[n_classes,H,W]`` tensors.
+
+        Upscales once per unique ``(image, class)`` after OR-ing low-res logits
+        (cheaper than upscaling every box).
+        """
+        if features.dim() == 3:
+            features = features.unsqueeze(0)
+        n_img = int(features.shape[0])
+        if len(requests) != n_img:
+            raise ValueError(
+                f"decode_multi: features N={n_img} but {len(requests)} requests"
+            )
+
+        outs = []
+        img_ids: list[int] = []
+        boxes_all = []
+        meta = []  # (img_i, cls)
+        image_hw_ref = None
+
+        for i, req in enumerate(requests):
+            classes, boxes_xyxy, n_classes, image_hw = req
+            h, w = int(image_hw[0]), int(image_hw[1])
+            if image_hw_ref is None:
+                image_hw_ref = (h, w)
+            elif image_hw_ref != (h, w):
+                raise ValueError(
+                    f"decode_multi requires uniform image_hw; "
+                    f"got {image_hw_ref} and {(h, w)}"
+                )
+            refined = torch.zeros(
+                (int(n_classes), h, w), device=self.dev, dtype=torch.float32
+            )
+            outs.append(refined)
+            if not boxes_xyxy:
+                continue
+            for cls, box in zip(classes, boxes_xyxy):
+                if cls < 0 or cls >= n_classes:
+                    continue
+                x0, y0, x1, y1 = [float(v) for v in box]
+                x0 = max(0, min(w - 1, x0))
+                x1 = max(0, min(w - 1, x1))
+                y0 = max(0, min(h - 1, y0))
+                y1 = max(0, min(h - 1, y1))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                img_ids.append(i)
+                boxes_all.append(np.array([x0, y0, x1, y1], dtype=np.float32))
+                meta.append((i, int(cls)))
+
         self.last_timing = {
             "decoder_ms": 0.0,
+            "trt_ms": 0.0,
+            "upscale_ms": 0.0,
             "n_boxes": 0,
+            "n_upscales": 0,
             "decoder_ms_per_box": 0.0,
-            "decoder_mode": "batched" if self._batch_ok else "serial",
+            "decoder_mode": "batched",
+            "n_images": n_img,
         }
-        if not boxes_xyxy:
-            return refined
+        if not boxes_all:
+            return outs
 
-        valid_cls = []
-        valid_boxes = []
-        for cls, box in zip(classes, boxes_xyxy):
-            if cls < 0 or cls >= n_classes:
-                continue
-            x0, y0, x1, y1 = [float(v) for v in box]
-            x0 = max(0, min(w - 1, x0))
-            x1 = max(0, min(w - 1, x1))
-            y0 = max(0, min(h - 1, y0))
-            y1 = max(0, min(h - 1, y1))
-            if x1 <= x0 or y1 <= y0:
-                continue
-            valid_cls.append(int(cls))
-            valid_boxes.append(np.array([x0, y0, x1, y1], dtype=np.float32))
-        if not valid_boxes:
-            return refined
+        profile = _profile()
+        if profile:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        mode = "serial"
-        if self._batch_ok:
-            try:
-                masks = self._predict_boxes_batched(features, valid_boxes, (h, w))
-                for i, cls in enumerate(valid_cls):
-                    refined[cls] = torch.maximum(refined[cls], masks[i])
-                mode = "batched"
-            except Exception as e:  # noqa: BLE001
-                self._warn(f"batched decode failed ({e}); serial fallback this frame")
-                self._batch_ok = False
-                mode = "serial"
+        idx = torch.tensor(img_ids, device=features.device, dtype=torch.long)
+        features_b = features.index_select(0, idx).contiguous()
+        low_res, trt_info = self._run_decoder(features_b, boxes_all, image_hw_ref)
 
-        if mode == "serial":
-            for cls, box in zip(valid_cls, valid_boxes):
-                mask_t = self._predict_box(features, box, (h, w))
-                refined[cls] = torch.maximum(refined[cls], mask_t)
+        # OR low-res logits per (image, class), then one upsample each.
+        merged: dict[tuple[int, int], torch.Tensor] = {}
+        for mi, key in enumerate(meta):
+            row = low_res[mi : mi + 1]
+            prev = merged.get(key)
+            merged[key] = row if prev is None else torch.maximum(prev, row)
 
-        torch.cuda.synchronize()
-        decoder_ms = (time.perf_counter() - t0) * 1000.0
-        n_pred = len(valid_boxes)
+        if profile:
+            torch.cuda.synchronize()
+            t_up0 = time.perf_counter()
+
+        for (img_i, cls), lr in merged.items():
+            hi = self._upscale_low_res(lr, image_hw_ref)
+            outs[img_i][cls] = (hi[0, 0] > 0).float()
+
+        if profile:
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            decoder_ms = (t1 - t0) * 1000.0
+            upscale_ms = (t1 - t_up0) * 1000.0
+            trt_ms = float(trt_info.get("trt_ms", 0.0))
+        else:
+            decoder_ms = 0.0
+            upscale_ms = 0.0
+            trt_ms = 0.0
+
+        n_pred = len(boxes_all)
         self.last_timing = {
             "decoder_ms": decoder_ms,
+            "trt_ms": trt_ms,
+            "upscale_ms": upscale_ms,
             "n_boxes": n_pred,
+            "n_upscales": len(merged),
             "decoder_ms_per_box": (decoder_ms / n_pred) if n_pred else 0.0,
-            "decoder_mode": mode,
+            "decoder_mode": "batched",
+            "n_images": n_img,
         }
-        return refined
+        return outs
