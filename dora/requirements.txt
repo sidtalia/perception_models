@@ -13,3 +13,5 @@
 dora-rs-cli>=0.3.0
 dora-rs>=0.3.0
 pyarrow
+# pyarrow type inference imports dateutil per scalar; missing = ~30x slower encodes
+python-dateutil

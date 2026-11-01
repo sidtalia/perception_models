@@ -16,16 +16,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
+class _nullctx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 def load_seg_config(path: str | None = None) -> dict[str, Any]:
-    """Load segmentation JSON written by launch (HOUND_SEG_CONFIG)."""
-    cfg_path = path or os.environ.get("HOUND_SEG_CONFIG", "")
+    """Load the segmentation config (JSON or YAML).
+
+    Resolution order: ``path`` argument, ``--config <file>`` on the command line,
+    then the ``SEG_CONFIG`` / ``HOUND_SEG_CONFIG`` environment variables.
+    """
+    import sys
+
+    cfg_path = path
+    if not cfg_path and "--config" in sys.argv:
+        i = sys.argv.index("--config")
+        if i + 1 < len(sys.argv):
+            cfg_path = sys.argv[i + 1]
+    cfg_path = cfg_path or os.environ.get("SEG_CONFIG") or os.environ.get("HOUND_SEG_CONFIG", "")
     if not cfg_path:
-        raise RuntimeError("HOUND_SEG_CONFIG is not set")
+        raise RuntimeError("no segmentation config: pass --config <file> or set SEG_CONFIG")
     with open(cfg_path, "r", encoding="utf-8") as f:
+        if cfg_path.endswith((".yaml", ".yml")):
+            import yaml
+
+            return dict(yaml.safe_load(f) or {})
         return json.load(f)
 
 
@@ -92,15 +115,7 @@ class ClipSegParts:
         )
         self.extract = list(self.model.extract_layers)
 
-        tok = self.proc.tokenizer(
-            prompts.full_prompts, return_tensors="pt", padding=True
-        ).to(device)
-        with torch.inference_mode():
-            self.cond = self.model.get_conditional_embeddings(
-                batch_size=len(prompts.full_prompts),
-                input_ids=tok.input_ids,
-                attention_mask=tok.attention_mask,
-            )
+        self.cond = self.embed_prompts(prompts.full_prompts)
 
         self._encode_mod: nn.Module | None = None
         self._decode_mod: nn.Module | None = None
@@ -108,6 +123,31 @@ class ClipSegParts:
         self._logged_map_shape = False
         # Reused pinned NHWC staging for preprocess_rgb_batch (avoids per-frame alloc).
         self._pin_nhwc: torch.Tensor | None = None
+
+    @torch.inference_mode()
+    def embed_prompts(
+        self, prompts, *, stream: torch.cuda.Stream | None = None
+    ) -> torch.Tensor:
+        """Tokenize + CLIP text tower → FiLM conditionals ``[P, C]`` (fp32, on device).
+
+        Safe to call from a background thread: pass a dedicated ``stream`` so the
+        text tower does not serialize behind the frame loop's kernels. The stream
+        is synchronized before returning, so the tensor is ready to use anywhere.
+        """
+        prompts = [str(p) for p in prompts]
+        if not prompts:
+            raise ValueError("at least one prompt is required")
+        tok = self.proc.tokenizer(prompts, return_tensors="pt", padding=True)
+        ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+        with ctx:
+            ids = tok.input_ids.to(self.device, non_blocking=True)
+            mask = tok.attention_mask.to(self.device, non_blocking=True)
+            cond = self.model.get_conditional_embeddings(
+                batch_size=len(prompts), input_ids=ids, attention_mask=mask
+            ).float().contiguous()
+        if stream is not None:
+            stream.synchronize()
+        return cond
 
     def _info(self, msg: str):
         if self._log:
@@ -222,8 +262,14 @@ class ClipSegParts:
         aggregate: str,
         height: int | None = None,
         width: int | None = None,
+        cond: torch.Tensor | None = None,
+        layout: PromptLayout | None = None,
     ) -> torch.Tensor:
         """Batched FiLM across images → group probs ``[N,G,H,W]`` (fp16).
+
+        ``cond`` / ``layout`` override the prompts fixed at construction (used
+        with a :class:`~perception_models.prompt_bank.PromptBank` snapshot so
+        prompts can change at runtime without touching shared state).
 
         ``stacked_hs``: ``[N,L,S,D]`` (or ``[L,S,D]``, treated as N=1).
         One decoder enqueue of size ``N * n_prompts`` instead of N serial decodes.
@@ -237,17 +283,19 @@ class ClipSegParts:
                 f"stacked_hs expected [N,L,S,D] or [L,S,D], got {tuple(stacked_hs.shape)}"
             )
 
+        cond = self.cond if cond is None else cond
+        layout = self.prompts if layout is None else layout
         with torch.autocast("cuda", dtype=torch.float16):
-            sub = dec(stacked_hs, self.cond)  # [N,P,res,res]
+            sub = dec(stacked_hs, cond)  # [N,P,res,res]
             if sub.dtype != torch.float16:
                 sub = sub.to(dtype=torch.float16)
             if not self._logged_map_shape:
                 self._info(f"CLIPSeg FiLM map {tuple(sub.shape)} dtype={sub.dtype}")
                 self._logged_map_shape = True
 
-            groups = self.aggregate_groups_batch(sub, aggregate)  # [N,G,h,w]
-            if self.prompts.suppress_idx:
-                sky = sub[:, self.prompts.suppress_idx].amax(dim=1)  # [N,h,w]
+            groups = self.aggregate_groups_batch(sub, aggregate, layout)  # [N,G,h,w]
+            if layout.suppress_idx:
+                sky = sub[:, layout.suppress_idx].amax(dim=1)  # [N,h,w]
                 groups = (groups - sky.unsqueeze(1)).clamp_(0.0, 1.0)
             if height is None or width is None:
                 return groups.clamp_(0.0, 1.0)
@@ -263,15 +311,16 @@ class ClipSegParts:
         return self.aggregate_groups_batch(sub.unsqueeze(0), aggregate)[0]
 
     def aggregate_groups_batch(
-        self, sub: torch.Tensor, aggregate: str
+        self, sub: torch.Tensor, aggregate: str, layout: PromptLayout | None = None
     ) -> torch.Tensor:
         """Batched [N,P,H,W] -> [N,n_groups,H,W]."""
         if sub.dim() != 4:
             raise ValueError(f"expected [N,P,H,W], got {tuple(sub.shape)}")
+        layout = self.prompts if layout is None else layout
         n, _p, hh, ww = sub.shape
-        out = sub.new_zeros((n, self.prompts.n_groups, hh, ww))
+        out = sub.new_zeros((n, layout.n_groups, hh, ww))
         agg = (aggregate or "max").lower()
-        for gi, idx in enumerate(self.prompts.group_index):
+        for gi, idx in enumerate(layout.group_index):
             if not idx:
                 continue
             s = sub[:, idx]  # [N,k,H,W]

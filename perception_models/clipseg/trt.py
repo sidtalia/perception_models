@@ -166,3 +166,19 @@ def trt_decode_film(
             f"CLIPSeg FiLM TRT output {tuple(probs.shape)} != N={n} P={p}"
         )
     return probs.to(dtype=torch.float16).contiguous().clone()
+
+
+@torch.inference_mode()
+def film_engine_error(trt_dec, eager_dec, hs_shape, cond_dim: int, n_prompts: int, *, seed: int = 0) -> float:
+    """Max |TRT - eager| FiLM probability on random inputs (startup self-check).
+
+    Some TensorRT versions miscompile the FiLM graph (wrong output while the
+    ONNX is correct). Callers fall back to the eager decoder when this is large.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    hs = torch.randn(*hs_shape, device="cuda", generator=g)
+    cond = torch.randn(n_prompts, cond_dim, device="cuda", generator=g)
+    a = trt_dec(hs, cond).float()
+    with torch.autocast("cuda", dtype=torch.float16):
+        b = eager_dec(hs, cond).float()
+    return float((a - b).abs().max())

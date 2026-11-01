@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Minimal ``trtexec`` stand-in built on the TensorRT Python API.
+
+pip-installed TensorRT (x86 desktops) ships no ``trtexec`` binary. This shim
+accepts the subset of flags the build scripts use, so they run unchanged:
+
+  --onnx=F --saveEngine=F [--fp16] [--minShapes/--optShapes/--maxShapes=name:AxBxC,...]
+  [--skipInference] [--memPoolSize=workspace:MiB]  (DLA flags are ignored)
+"""
+
+from __future__ import annotations
+
+import sys
+
+
+def _parse(argv: list[str]) -> dict[str, str | bool]:
+    out: dict[str, str | bool] = {}
+    for a in argv:
+        if not a.startswith("--"):
+            continue
+        k, _, v = a[2:].partition("=")
+        out[k] = v if v else True
+    return out
+
+
+def _shapes(spec: str) -> dict[str, tuple[int, ...]]:
+    res = {}
+    for item in str(spec).split(","):
+        if not item:
+            continue
+        name, _, dims = item.rpartition(":")
+        res[name] = tuple(int(d) for d in dims.split("x"))
+    return res
+
+
+def main() -> int:
+    import tensorrt as trt
+
+    args = _parse(sys.argv[1:])
+    onnx_path, engine_path = str(args["onnx"]), str(args["saveEngine"])
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(0)
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(onnx_path):
+        for i in range(parser.num_errors):
+            print(parser.get_error(i), file=sys.stderr)
+        return 1
+    config = builder.create_builder_config()
+    if args.get("fp16"):
+        config.set_flag(trt.BuilderFlag.FP16)
+    if "memPoolSize" in args:
+        mib = int(str(args["memPoolSize"]).split(":")[-1].rstrip("M"))
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, mib << 20)
+    if "minShapes" in args:
+        mins, opts, maxs = (_shapes(str(args[k])) for k in ("minShapes", "optShapes", "maxShapes"))
+        profile = builder.create_optimization_profile()
+        for name in mins:
+            profile.set_shape(name, mins[name], opts[name], maxs[name])
+        config.add_optimization_profile(profile)
+    blob = builder.build_serialized_network(network, config)
+    if blob is None:
+        print("engine build failed", file=sys.stderr)
+        return 1
+    with open(engine_path, "wb") as f:
+        f.write(blob)
+    print(f"wrote {engine_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
