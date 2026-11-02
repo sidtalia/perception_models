@@ -20,6 +20,12 @@ EMB=$((SIZE / 16))          # 32
 MASK_IN=$((4 * EMB))        # 128
 
 ENC_ONNX_SRC="${DATA}/resnet18_image_encoder.onnx"
+if [[ ! -f "${ENC_ONNX_SRC}" ]]; then
+  echo "Missing ${ENC_ONNX_SRC}" >&2
+  echo "NVIDIA's Drive link is dead. Download the copy this tree uses:" >&2
+  echo "  wget -O ${ENC_ONNX_SRC} https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/resnet18_image_encoder.onnx" >&2
+  exit 1
+fi
 ENC_ONNX="${DATA}/resnet18_image_encoder_${SIZE}.onnx"
 ENC_ENGINE="${DATA}/resnet18_image_encoder_${SIZE}.engine"
 DEC_ONNX="${DATA}/mobile_sam_mask_decoder_batched_${SIZE}.onnx"

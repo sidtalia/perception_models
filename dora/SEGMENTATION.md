@@ -95,6 +95,13 @@ Default (512), under `perception_models/data/`:
 - `resnet18_image_encoder_512.engine`
 - `mobile_sam_mask_decoder_batched_512.engine`
 
+`resnet18_image_encoder.onnx` is not produced here. NVIDIA's Drive link is dead. Fetch the matching copy, then build:
+
+```bash
+wget -O /root/colcon_ws/src/perception_models/data/resnet18_image_encoder.onnx \
+  https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/resnet18_image_encoder.onnx
+```
+
 Build / rebuild the 512 pair on **this** Orin (inside the GPU container):
 
 ```bash

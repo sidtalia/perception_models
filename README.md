@@ -55,4 +55,15 @@ when TensorRT reports `num_DLA_cores > 0`. On JetPack 7.2 (L4T R39.2) TRT report
 to GPU FP16. `build_all_engines.sh` maps vision/encoder → DLA 0, FiLM/decoder → DLA 1
 when DLA is available. Dynamic-shape NanoSAM: `USE_DLA_DYNAMIC=0` if needed.
 
+The NanoSAM encoder starts from `data/resnet18_image_encoder.onnx`. NVIDIA's Drive link for that file is dead. Download the copy that matches the file this tree was built from:
+
+https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/resnet18_image_encoder.onnx
+
+```bash
+wget -O data/resnet18_image_encoder.onnx \
+  https://raw.githubusercontent.com/johnnynunez/nanosam/main/data/resnet18_image_encoder.onnx
+```
+
+Then `build_all_engines.sh`. It reshapes that ONNX to 512 and builds the engine. Do not copy the `.engine` onto another Jetson.
+
 Upstream NanoSAM tooling: `nanosam-src/` (`pip install -e`).
