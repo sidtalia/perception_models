@@ -85,3 +85,18 @@ Production path = torch FP16 + stashed `.pt`. Loader stub: `yolo_world/trt.py`.
 * [x] CLIPSeg skips people when YOLO owns people
 * [x] spencer `--vision yolo_dets` → `/yolo_world/detections`
 * [ ] TRT engine load (`yolo_world/trt.py`) — blocked on ONNX
+* [x] dora-io branch: ROS-free node (`camera_frame` in, `detections` out); prompts via
+      `PromptBank` (background CLIP text embed, atomic swap per frame)
+* [x] `seg_refine` `object_source: yolo_world`: SAM encode on frame arrival ∥ detection,
+      stamp-matched detections → one batched decode (CLIPSeg not loaded)
+* [ ] Nav (CLIPSeg) + manip (YOLO) dual decode on the dora-io branch: refine runs one
+      source at a time today
+
+### dora-io notes
+
+* Text embeddings: `transformers` CLIP ViT-B/32 (`openai/clip-vit-base-patch32`), identical
+  to ultralytics' `clip:ViT-B/32` (cos 1.0); the `clip` git package is not needed.
+* `YoloWorldParts.load()` sets `YOLO_AUTOINSTALL=false` and `YOLO_OFFLINE=true` (no runtime
+  pip installs, no analytics) and requires `yolo_model` to be a local file.
+* Measured on the PRAXIS YCB scene (RTX PRO 6000, 640x480, `yolov8l-worldv2`, FP16): ~38 ms
+  per frame; prompts "mustard bottle" / "soup can" / "mug" all detected (0.34 / 0.76 / 0.86).

@@ -12,6 +12,7 @@ from perception_models.dora_io import (
     decode,
     decode_camera_frame,
     encode,
+    encode_detections,
     encode_seg_masks,
     is_camera_input,
     join_stamp,
@@ -111,3 +112,15 @@ def test_is_camera_input():
     assert is_camera_input("image_left", [])
     assert not is_camera_input("prompt", [])
     assert is_camera_input("scene", ["scene"]) and not is_camera_input("cam_x", ["scene"])
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_detections_message_roundtrip(k):
+    cam = {"name": "scene", "stamp": 7.25, "height": 480, "width": 640,
+           "boxes": np.arange(4 * k, dtype=np.float32).reshape(k, 4),
+           "scores": np.linspace(0.9, 0.1, k).astype(np.float32), "class_idx": np.arange(k, dtype=np.int32)}
+    t, body = decode(encode_detections(stamp=7.25, prompts=["mug", "can", "bottle"], prompt_version=2, cameras=[cam]))
+    assert t == "detections" and body["stamp"] == 7.25 and body["prompts"] == ["mug", "can", "bottle"]
+    c = body["cameras"][0]
+    assert c["boxes"].shape == (k, 4) and c["class_idx"].dtype == np.int32
+    np.testing.assert_array_equal(c["scores"], cam["scores"])

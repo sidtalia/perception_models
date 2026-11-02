@@ -201,3 +201,29 @@ def encode_seg_masks(
         "seg_masks",
         {"stamp": float(stamp), "prompts": list(prompts), "prompt_version": int(prompt_version), "cameras": cameras},
     )
+
+
+def encode_detections(
+    *,
+    stamp: float,
+    prompts: list[str],
+    prompt_version: int,
+    cameras: list[dict[str, Any]],
+) -> pa.StructArray:
+    """Build the ``detections`` output message (open-vocabulary detector boxes).
+
+    Args:
+        stamp: stamp of the leader camera frame (seconds, as received). Consumers
+            pair detections with that exact frame.
+        prompts: class prompts the boxes were detected with; ``class_idx`` indexes it.
+        prompt_version: increments on every prompt update.
+        cameras: one dict per camera::
+
+            {"name": str, "stamp": float, "height": int, "width": int,
+             "boxes": float32 [K,4] xyxy pixels, "scores": float32 [K],
+             "class_idx": int32 [K]}
+    """
+    return encode(
+        "detections",
+        {"stamp": float(stamp), "prompts": list(prompts), "prompt_version": int(prompt_version), "cameras": cameras},
+    )

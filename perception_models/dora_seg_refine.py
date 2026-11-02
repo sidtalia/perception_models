@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
-"""Dora-only prompted segmentation: CLIPSeg FiLM ∥ NanoSAM encode, then batched SAM decode.
+"""Dora-only prompted segmentation: box proposals ∥ NanoSAM encode, then batched SAM decode.
 
-Per frame (N cameras, one batch):
+Two sources of box proposals (``object_source``):
+
+* ``clipseg`` (default): CLIPSeg FiLM maps in this process (below).
+* ``yolo_world``: boxes from the ``dora_yolo_world`` detector node. The camera
+  frames come straight into this node too. NanoSAM encodes each frame as soon
+  as it arrives, while YOLO-World detects the same frame in its own process.
+  When the detections with the matching stamp arrive, their boxes go through the
+  same single batched decode. Prompts then go to the detector, not here.
+  CLIPSeg is not loaded in this mode; it is meant for scene semantics.
+
+CLIPSeg path, per frame (N cameras, one batch):
 
 1. FiLM decode for all ``N x P`` image-prompt pairs runs on ``stream_film``.
    At the same time, the NanoSAM image encoder runs for all N images on
@@ -27,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -43,8 +54,17 @@ from perception_models.clipseg.shared import (
 )
 from perception_models.clipseg.trt import TrtFilmDecoder, film_engine_error, load_clipseg_film_engine
 from perception_models.cuda_ipc import unpack_arrow_f16, unpack_cuda_tensor
-from perception_models.dora_io import encode_seg_masks, join_stamp, parse_prompts
-from perception_models.instance_select import Instance, propose_instances
+from perception_models.dora_io import (
+    LatestFrameSync,
+    WireError,
+    decode,
+    decode_camera_frame,
+    encode_seg_masks,
+    is_camera_input,
+    join_stamp,
+    parse_prompts,
+)
+from perception_models.instance_select import Instance, instances_from_detections, propose_instances
 from perception_models.multicam_rgb_batch import unpack_rgb_batch
 from perception_models.nanosam_trt import NanoSamDecoder, NanoSamEncoder
 from perception_models.prompt_bank import PromptBank, PromptSet
@@ -91,7 +111,7 @@ def layout_for(prompts: tuple[str, ...]) -> PromptLayout:
 
 
 class SegRefineNode:
-    """FiLM TRT ∥ NanoSAM encode → batched decode → prompted instance masks."""
+    """Box proposals (CLIPSeg FiLM or YOLO-World) ∥ NanoSAM encode → batched decode → instance masks."""
 
     def __init__(self, cfg: dict):
         if not torch.cuda.is_available():
@@ -105,22 +125,11 @@ class SegRefineNode:
             os.environ["PROFILE"] = "1"
 
         self.batch_n = max(1, int(cfg.get("clipseg_batch_n", 1)))
-        initial_layout = prompt_layout_from_config(cfg)
-        self.parts = ClipSegParts(
-            str(cfg.get("model_name", "CIDAS/clipseg-rd16")),
-            initial_layout,
-            input_res=int(cfg.get("input_res", 224)),
-            compile_mode="none",
-            device="cuda",
-            logger=self.log,
-        )
-        self.dec = self._load_film_decoder()
-
-        self.aggregate = str(cfg.get("aggregate", "max")).lower()
-        self.threshold = float(cfg.get("threshold", 0.4))
-        self.min_area_frac = float(cfg.get("sam_min_area", 0.0005))
+        self.object_source = str(cfg.get("object_source", "clipseg")).lower()
+        if self.object_source not in ("clipseg", "yolo_world"):
+            raise ValueError(f"object_source must be clipseg or yolo_world, got {self.object_source!r}")
         self.max_inst = int(cfg.get("max_instances_per_prompt", 2))
-        self.box_pad = float(cfg.get("box_pad_frac", 0.08))
+        self.min_area_frac = float(cfg.get("sam_min_area", 0.0005))
 
         enc_path = str(cfg.get("sam_image_encoder", "") or "").strip()
         dec_path = str(cfg.get("sam_mask_decoder", "") or "").strip()
@@ -136,21 +145,12 @@ class SegRefineNode:
             logger=_Logger(),
             max_batch_k=max(4, int(cfg.get("sam_decoder_max_batch", 16))),
         )
-        self.stream_film = torch.cuda.Stream()
         self.stream_sam = torch.cuda.Stream()
-        self.stream_text = torch.cuda.Stream()
-
-        # Prompt embeddings: startup set embedded synchronously, then live updates in the background.
-        self._layouts: dict[int, PromptLayout] = {}
-        self.prompts = PromptBank(
-            lambda ps: self.parts.embed_prompts(ps, stream=self.stream_text),
-            max_prompts=self.film_slots,
-            on_update=lambda s: self.log(f"prompts v{s.version} active: {list(s.prompts)}"),
-            on_error=lambda ps, e: self.log(f"WARN prompt embedding failed for {list(ps)}: {e}"),
-        )
-        start = [p for p in initial_layout.subprompts if p]
-        if start:
-            self.prompts.set_blocking(start)
+        self.prompts: PromptBank | None = None
+        if self.object_source == "clipseg":
+            self._init_clipseg(cfg)
+        else:
+            self._init_yolo(cfg)
 
         self.pending_rgb: tuple | None = None
         self.pending_feat: tuple | None = None
@@ -165,13 +165,60 @@ class SegRefineNode:
         self.e2e_log_every_s = max(1.0, float(cfg.get("e2e_log_every_s", 30.0)))
         self.e2e_log_t0 = time.perf_counter()
         self.log(
-            f"dora seg_refine up: FiLM∥SAM-encode → batched decode; batch_n={self.batch_n} "
-            f"prompt_slots={self.film_slots} viz={'on' if self.dora_viz else 'off'}"
+            f"dora seg_refine up: {self.object_source} boxes ∥ SAM-encode → batched decode; "
+            f"batch_n={self.batch_n} {self.film_info} viz={'on' if self.dora_viz else 'off'}"
         )
 
     @staticmethod
     def log(msg: str) -> None:
         print(f"[dora_seg_refine] {msg}", flush=True)
+
+    def _init_clipseg(self, cfg: dict) -> None:
+        initial_layout = prompt_layout_from_config(cfg)
+        self.parts = ClipSegParts(
+            str(cfg.get("model_name", "CIDAS/clipseg-rd16")),
+            initial_layout,
+            input_res=int(cfg.get("input_res", 224)),
+            compile_mode="none",
+            device="cuda",
+            logger=self.log,
+        )
+        self.dec = self._load_film_decoder()
+        self.aggregate = str(cfg.get("aggregate", "max")).lower()
+        self.threshold = float(cfg.get("threshold", 0.4))
+        self.box_pad = float(cfg.get("box_pad_frac", 0.08))
+        self.stream_film = torch.cuda.Stream()
+        self.stream_text = torch.cuda.Stream()
+
+        # Prompt embeddings: startup set embedded synchronously, then live updates in the background.
+        self._layouts: dict[int, PromptLayout] = {}
+        self.prompts = PromptBank(
+            lambda ps: self.parts.embed_prompts(ps, stream=self.stream_text),
+            max_prompts=self.film_slots,
+            on_update=lambda s: self.log(f"prompts v{s.version} active: {list(s.prompts)}"),
+            on_error=lambda ps, e: self.log(f"WARN prompt embedding failed for {list(ps)}: {e}"),
+        )
+        start = [p for p in initial_layout.subprompts if p]
+        if start:
+            self.prompts.set_blocking(start)
+        self.film_info = f"prompt_slots={self.film_slots}"
+
+    def _init_yolo(self, cfg: dict) -> None:
+        self.det_min_score = float(cfg.get("det_min_score", 0.0))
+        self.box_pad = float(cfg.get("det_box_pad_frac", 0.02))
+        cams = [str(c) for c in (cfg.get("camera_inputs") or []) if str(c)]
+        self.camera_inputs = cams
+        self._sync: LatestFrameSync | None = LatestFrameSync(cams) if cams else None
+        # Frames SAM-encoded but not yet decoded, and detections that beat their frame here.
+        # Keyed by the leader camera's float stamp, which both nodes copy from the same frame.
+        depth = max(2, int(cfg.get("match_depth", 4)))
+        self._encoded: deque[tuple[float, dict]] = deque(maxlen=depth)
+        self._early_dets: deque[tuple[float, dict]] = deque(maxlen=depth)
+        self.n_unmatched = 0
+        # Warm the encoder so the first real frame is not slowed by lazy init.
+        dummy = [np.zeros((64, 64, 3), np.uint8)] * self.batch_n
+        _ = self.sam_encoder.encode_tensor(self.sam_encoder.preprocess_batch(dummy), synchronize=True)
+        self.film_info = f"detector boxes (camera_inputs={cams or 'auto'})"
 
     def _load_film_decoder(self):
         """FiLM decoder: TRT engine if it matches eager on a self-check, else eager fp16.
@@ -223,6 +270,7 @@ class SegRefineNode:
 
     # ------------------------------------------------------------ hot path
     def _run_matched(self, meta_rgb: dict, rgbs: list, feat_event) -> None:
+        assert self.prompts is not None
         snap = self.prompts.current()
         hs = _open_features(feat_event, non_blocking=True)
         if snap is None:
@@ -274,8 +322,13 @@ class SegRefineNode:
 
         stamps = frame_stamps(meta_rgb, n_cams)
         names = [str(x) for x in (meta_rgb.get("frame_ids") or [])] + [f"cam{i}" for i in range(n_cams)]
+        self._emit(stamps, names[:n_cams], (h, w), insts, masks_all, list(snap.prompts), snap.version, meta_rgb, rgbs[0])
+
+    def _emit(self, stamps, names, hw, insts, masks_all, prompts, version, meta_src, rgb0) -> None:
+        """Pack per-camera instance masks into one ``seg_masks`` message and send it."""
+        h, w = hw
         cameras = []
-        for i in range(n_cams):
+        for i in range(len(insts)):
             k = len(insts[i])
             m = (masks_all[i][:k] > 0.5).to(torch.uint8).cpu().numpy() if k else np.zeros((0, h, w), np.uint8)
             cameras.append(
@@ -290,14 +343,119 @@ class SegRefineNode:
                     "boxes": np.array([x.box for x in insts[i]], dtype=np.float32).reshape(k, 4),
                 }
             )
-        out_meta = {"stamp": stamps[0], "prompt_version": snap.version, "n_cams": n_cams}
+        out_meta = {"stamp": stamps[0], "prompt_version": int(version), "n_cams": len(insts)}
         self.dora.send_output(
             "masks",
-            encode_seg_masks(stamp=stamps[0], prompts=list(snap.prompts), prompt_version=snap.version, cameras=cameras),
+            encode_seg_masks(stamp=stamps[0], prompts=list(prompts), prompt_version=int(version), cameras=cameras),
             out_meta,
         )
-        self._record_e2e(meta_rgb)
-        self._maybe_viz(rgbs[0], cameras[0], out_meta)
+        self._record_e2e(meta_src)
+        self._maybe_viz(rgb0, cameras[0], out_meta)
+
+    # ------------------------------------------------- hot path (yolo_world)
+    def _on_yolo_camera(self, input_id: str, event) -> None:
+        """New camera frame: start its SAM encode now, overlapping the detector's work on it."""
+        try:
+            frame = decode_camera_frame(event["value"])
+        except WireError as e:
+            self.log(f"WARN {input_id}: {e}")
+            return
+        frame["_t_rx"] = time.perf_counter()
+        if self._sync is None:
+            self._sync = LatestFrameSync([input_id])
+        if input_id not in self._sync.cameras:
+            if len(self._sync.cameras) >= self.batch_n:
+                return
+            self._sync.cameras.append(input_id)
+        batch = self._sync.push(input_id, frame)
+        if batch is None:
+            return
+        rgbs = [f["rgb"] for f in batch]
+        if len({r.shape for r in rgbs}) != 1:
+            self.log(f"WARN skip: mismatched RGB shapes {[r.shape for r in rgbs]}")
+            return
+        sam_input = self.sam_encoder.preprocess_batch(rgbs)
+        self.stream_sam.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream_sam):
+            feats = self.sam_encoder.encode_tensor(sam_input, synchronize=False)
+            done = torch.cuda.Event()
+            done.record(self.stream_sam)
+        key = float(batch[0]["stamp"])
+        entry = {
+            "rgbs": rgbs,
+            "feats": feats,
+            "done": done,
+            "stamps": [float(f["stamp"]) for f in batch],
+            "names": [str(f.get("name") or c) for f, c in zip(batch, self._sync.cameras)],
+            "t_src_perf": batch[0]["_t_rx"],
+        }
+        for i, (k, det) in enumerate(self._early_dets):
+            if k == key:
+                del self._early_dets[i]
+                self._decode_yolo(entry, det)
+                return
+        if len(self._encoded) == self._encoded.maxlen:
+            self.n_unmatched += 1  # oldest frame never got detections (detector dropped it)
+        self._encoded.append((key, entry))
+
+    def _on_detections(self, event) -> None:
+        try:
+            kind, det = decode(event["value"])
+        except Exception as e:  # noqa: BLE001
+            self.log(f"WARN bad detections: {e}")
+            return
+        if kind != "detections":
+            self.log(f"WARN expected a detections message, got {kind!r}")
+            return
+        key = float(det["stamp"])
+        for i, (k, entry) in enumerate(self._encoded):
+            if k == key:
+                # Older frames can no longer match: detections arrive in frame order.
+                for _ in range(i + 1):
+                    self._encoded.popleft()
+                self._decode_yolo(entry, det)
+                return
+        self._early_dets.append((key, det))
+
+    def _decode_yolo(self, entry: dict, det: dict) -> None:
+        t0 = time.perf_counter()
+        cams = list(det.get("cameras") or [])
+        h, w = entry["rgbs"][0].shape[:2]
+        insts: list[list[Instance]] = []
+        for i in range(len(entry["rgbs"])):
+            c = cams[i] if i < len(cams) else {}
+            insts.append(
+                instances_from_detections(
+                    np.asarray(c.get("boxes", np.zeros((0, 4))), dtype=np.float64),
+                    np.asarray(c.get("scores", []), dtype=np.float64),
+                    np.asarray(c.get("class_idx", []), dtype=np.int64),
+                    (h, w),
+                    min_score=self.det_min_score,
+                    max_instances_per_prompt=self.max_inst,
+                    box_pad_frac=self.box_pad,
+                )
+            )
+        entry["done"].synchronize()
+        t1 = time.perf_counter()
+        reqs = [(list(range(len(il))), [x.box for x in il], max(1, len(il)), (h, w)) for il in insts]
+        masks_all = self.sam_decoder.decode_multi(entry["feats"], reqs)
+        if self.profile:
+            print(
+                f"SAM-enc wait {(t1 - t0) * 1e3:.1f} ms | SAM decode {(time.perf_counter() - t1) * 1e3:.1f} ms "
+                f"(boxes={sum(len(il) for il in insts)})",
+                flush=True,
+            )
+        self._emit(
+            entry["stamps"],
+            entry["names"],
+            (h, w),
+            insts,
+            masks_all,
+            list(det.get("prompts") or []),
+            int(det.get("prompt_version", 0)),
+            {"t_src_perf": entry["t_src_perf"]},
+            entry["rgbs"][0],
+        )
 
     def _record_e2e(self, meta_rgb: dict) -> None:
         t0 = meta_rgb.get("t_src_perf")
@@ -336,10 +494,18 @@ class SegRefineNode:
     # -------------------------------------------------------------- events
     def _on_event(self, event) -> None:
         eid = event["id"]
+        if self.object_source == "yolo_world":
+            if eid == "detections":
+                self._on_detections(event)
+            elif eid == "prompt":
+                self.log("WARN prompt input ignored: with object_source=yolo_world, send prompts to the detector")
+            elif is_camera_input(eid, self.camera_inputs):
+                self._on_yolo_camera(eid, event)
+            return
         if eid == "prompt":
             try:
                 prompts = parse_prompts(event["value"])
-                if prompts and self.prompts.request(prompts):
+                if prompts and self.prompts is not None and self.prompts.request(prompts):
                     self.log(f"prompt update queued: {prompts}")
             except Exception as e:  # noqa: BLE001
                 self.log(f"WARN bad prompt update: {e}")
@@ -366,7 +532,8 @@ class SegRefineNode:
                 if event.get("type") == "INPUT":
                     self._on_event(event)
         finally:
-            self.prompts.close()
+            if self.prompts is not None:
+                self.prompts.close()
             self.box_pool.shutdown(wait=False)
             if self.viz_pool is not None:
                 self.viz_pool.shutdown(wait=False)

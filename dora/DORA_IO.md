@@ -8,8 +8,12 @@
 * **Output:** `masks` is a `seg_masks` message holding per-camera instance masks for the prompted
   objects only, plus scores, boxes, the source frame stamp and `prompt_version`. There is no
   traversability output.
-* **Unchanged:** CLIPSeg vision runs in its own process, FiLM ∥ SAM-encode run on two CUDA
-  streams, then one batched SAM decode.
+* **Box source (`object_source`):** `clipseg` (default) or `yolo_world`. With `yolo_world`,
+  `dora_yolo_world.py` owns the prompts and emits `detections`
+  (`dora_io.encode_detections`). Refine takes the camera inputs directly, starts the SAM
+  encode on frame arrival, pairs detections by the leader frame's stamp, and does not load CLIPSeg.
+* **Unchanged:** box proposals run in parallel with the SAM encode, then one batched SAM
+  decode. For CLIPSeg, vision runs in its own process and FiLM ∥ SAM-encode run on two CUDA streams.
 * **x86 / pip TensorRT:** `scripts/build_engines_x86.sh` uses the `scripts/trtexec_py` shim. The
   SAM encoder defaults to MobileSAM TinyViT (FP32; FP16 LayerNorms overflow in TRT 10.13).
   The FiLM TRT engine is self-checked against eager at startup and falls back to eager FP16

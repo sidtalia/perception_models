@@ -15,3 +15,7 @@ dora-rs>=0.3.0
 pyarrow
 # pyarrow type inference imports dateutil per scalar; missing = ~30x slower encodes
 python-dateutil
+# YOLO-World detector (object_source: yolo_world). Install with torch pinned to the env's build, e.g.
+#   uv pip install ultralytics torch==2.8.0 torchvision==0.23.0
+# Text embeddings use transformers' CLIP (already required by CLIPSeg), not the `clip` git package.
+ultralytics>=8.3
